@@ -1,0 +1,125 @@
+---
+title: "case 1 dataset preparation for EDA"
+output: html_document
+date: "2026-04-17"
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+```
+ 
+ 
+```{r}
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+head(supermarket_raw)
+```
+
+
+```{r}
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price)
+  )
+
+head(long_data)
+str(long_data)
+summary(long_data)
+length(unique(long_data$transaction_id))
+```
+
+
+```{r}
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- long_data %>%
+  mutate(department_name = dept_map[as.character(department)])
+head(long_data)
+```
+
+
+```{r}
+long_data_clean <- long_data %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price)
+  )
+
+long_data_clean <- long_data_clean %>%
+  mutate(
+    price_per_second = ifelse(time > 0, price / time, NA_real_)
+  )
+```
+
+
+```{r}
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    price_per_second = total_price / total_time,
+    max_price = max(price),
+    min_price = min(price),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+head(basket_data)
+str(basket_data)
+summary(basket_data)
+```
+
+
+```{r}
+#check
+dim(long_data)
+head(long_data, 10)
+summary(long_data)
+sum(is.na(long_data$department))
+sum(is.na(long_data$time))
+sum(is.na(long_data$price))
+```
+
+
+
+
