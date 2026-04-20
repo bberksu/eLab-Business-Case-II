@@ -185,7 +185,7 @@ ggplot(basket_data, aes(x = avg_time_per_item)) +
        x = "Average Time per Item (seconds)", 
        y = "Frequency")
 
-# Boxplot to easily spot the extreme tail(s)
+
 ggplot(basket_data, aes(y = avg_time_per_item)) +
   geom_boxplot(fill = "lightgreen", outlier.color = "red", outlier.shape = 16) +
   theme_minimal() +
