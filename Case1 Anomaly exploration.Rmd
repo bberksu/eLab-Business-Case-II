@@ -1,0 +1,214 @@
+---
+title: "Supermarket Case - EDA & Anomaly Exploration"
+author: "Tristan & Hannes"
+date: "2026-04-20"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Setup and Libraries
+
+```{r libraries}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+```
+
+## 1. Data Preparation
+
+### Raw Data Loading
+
+```{r raw_data}
+lines <- readLines("C:/Users/Dirk/Downloads/supermarket/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+head(supermarket_raw)
+```
+
+### Parsing
+
+```{r parse_data}
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price)
+  )
+
+head(long_data)
+str(long_data)
+summary(long_data)
+length(unique(long_data$transaction_id))
+```
+
+### Mapping Departments
+
+```{r mapping}
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- long_data %>%
+  mutate(department_name = dept_map[as.character(department)])
+
+head(long_data)
+```
+
+### Data Cleaning
+
+```{r cleaning}
+long_data_clean <- long_data %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price)
+  ) %>%
+  mutate(
+    price_per_second = ifelse(time > 0, price / time, NA_real_)
+  )
+```
+
+## 2. Basket Summary
+
+```{r summary}
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = total_time / total_items,
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price),
+    min_price = min(price),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+head(basket_data)
+str(basket_data)
+summary(basket_data)
+```
+
+## 3. EDA - Anomaly Exploration
+
+### Tristan: Price-Based Anomalies
+
+#### 1. Very Low / Very High Total Price
+
+```{r tristan_price_distribution}
+# Visualize the distribution to see outliers
+ggplot(basket_data, aes(y = total_price)) +
+  geom_boxplot(fill = "skyblue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  labs(title = "Tristan: Distribution of Total Basket Price", 
+       y = "Total Price", 
+       subtitle = "Red dots indicate potential price anomalies")
+
+# Isolate the extreme price baskets (e.g., bottom 1% and top 1%)
+price_bounds <- quantile(basket_data$total_price, probs = c(0.01, 0.99), na.rm = TRUE)
+extreme_price_baskets <- basket_data %>%
+  filter(total_price <= price_bounds[1] | total_price >= price_bounds[2]) %>%
+  arrange(desc(total_price))
+
+head(extreme_price_baskets)
+```
+
+#### 2. Expensive Items in Small Baskets
+
+```{r tristan_expensive_small}
+# Scatter plot looking for high max_price isolated on the left side (low total_items)
+ggplot(basket_data, aes(x = total_items, y = max_price)) +
+  geom_point(alpha = 0.5, color = "darkred") +
+  theme_minimal() +
+  labs(title = "Tristan: Max Item Price vs. Basket Size", 
+       x = "Total Items in Basket", 
+       y = "Max Price of a Single Item")
+
+# Filter for baskets with 3 or fewer items but containing an item in the top 5% most expensive
+high_price_threshold <- quantile(basket_data$max_price, 0.95, na.rm = TRUE)
+expensive_small_baskets <- basket_data %>%
+  filter(total_items <= 3 & max_price >= high_price_threshold) %>%
+  arrange(desc(max_price))
+
+head(expensive_small_baskets)
+```
+
+### Hannes: Time-Based Anomalies
+
+#### 1. Extremely Fast / Extremely Slow Scanning
+
+```{r hannes_time_distribution}
+# Visualize the distribution of average time per item
+ggplot(basket_data, aes(x = avg_time_per_item)) +
+  geom_histogram(bins = 60, fill = "lightgreen", color = "black") +
+  theme_minimal() +
+  labs(title = "Hannes: Distribution of Average Scan Time per Item", 
+       x = "Average Time per Item (seconds)", 
+       y = "Frequency")
+
+# Boxplot to easily spot the extreme tail(s)
+ggplot(basket_data, aes(y = avg_time_per_item)) +
+  geom_boxplot(fill = "lightgreen", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  labs(title = "Hannes: Outliers in Average Scan Time", 
+       y = "Average Time per Item (seconds)")
+
+# Isolate extreme time anomalies (e.g., bottom 1% and top 1% of scan speeds)
+time_bounds <- quantile(basket_data$avg_time_per_item, probs = c(0.01, 0.99), na.rm = TRUE)
+extreme_time_baskets <- basket_data %>%
+  filter(avg_time_per_item <= time_bounds[1] | avg_time_per_item >= time_bounds[2]) %>%
+  arrange(desc(avg_time_per_item))
+
+head(extreme_time_baskets)
+```
+
+#### 2. Total Time vs Total Items Checkout
+
+```{r hannes_total_time_items}
+# Optional: Checking total_time vs total_items to see if some massive baskets were scanned impossibly fast
+ggplot(basket_data, aes(x = total_items, y = total_time)) +
+  geom_point(alpha = 0.4, color = "purple") +
+  theme_minimal() +
+  labs(title = "Hannes: Total Time vs Total Items",
+       x = "Total Items",
+       y = "Total Time (seconds)")
+```
