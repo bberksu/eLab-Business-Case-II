@@ -6,11 +6,6 @@ date: "2026-04-17"
 
 ```{r}
 library(tidyverse)
-library(dplyr)
-library(tidyr)
-library(stringr)
-library(tibble)
-library (ggplot2)
 ```
  
 
@@ -36,7 +31,9 @@ long_data <- supermarket_raw %>%
   separate(
     basket,
     into = c("department", "time", "price"),
-    sep = "\\s+"
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
   ) %>%
   mutate(
     department = as.integer(department),
@@ -87,7 +84,9 @@ long_data_clean <- long_data %>%
   filter(
     !is.na(department),
     !is.na(time),
-    !is.na(price)
+    !is.na(price),
+    time >= 0,
+    price >= 0
   ) %>%
   mutate(
     price_per_second = ifelse(time > 0, price / time, NA_real_)
@@ -104,10 +103,13 @@ basket_data <- long_data_clean %>%
     total_price = sum(price, na.rm = TRUE),
     avg_price = mean(price, na.rm = TRUE),
     total_time = sum(time, na.rm = TRUE),
-    avg_time_per_item = total_time / total_items,
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
     price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
-    max_price = max(price),
-    min_price = min(price),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
     unique_departments = n_distinct(department),
     .groups = "drop"
   )
