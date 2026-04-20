@@ -1,0 +1,179 @@
+---
+title: "Supermarket Case - EDA & Anomaly Exploration"
+author: "Tristan & Hannes"
+date: "2026-04-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Setup and Libraries
+
+```{r libraries}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(scales) # Needed for the log scale formatting
+```
+
+### 1. Raw Data & Parse
+
+```{r raw_and_parse}
+lines <- readLines("C:/Users/Dirk/Downloads/supermarket/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price)
+  )
+```
+
+### 2. Mapping & Cleaning
+
+```{r mapping_and_cleaning}
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- long_data %>%
+  mutate(department_name = dept_map[as.character(department)])
+
+long_data_clean <- long_data %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price)
+  ) %>%
+  mutate(
+    price_per_second = ifelse(time > 0, price / time, NA_real_)
+  )
+```
+
+### 3. Summary
+
+```{r summary}
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = total_time / total_items,
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price),
+    min_price = min(price),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+```
+
+### 4. EDA - Anomaly Exploration
+
+#### TRISTAN: Price-Based Anomalies
+
+```{r tristan_price_anomalies}
+# 1. Very low / very high total price (> $500 or < $0.50)
+ggplot(basket_data, aes(y = total_price)) +
+  geom_boxplot(fill = "skyblue", outlier.color = "red", outlier.shape = 16) +
+  scale_y_log10(labels = label_comma()) +
+  geom_hline(yintercept = 500, linetype = "dashed", color = "darkred", linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "darkred", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Total Basket Price w/ Cutoffs (> $500 or < $0.50)", 
+       y = "Total Price (Log Scale)")
+
+extreme_price_baskets <- basket_data %>%
+  filter(total_price > 500 | total_price < 0.5) %>%
+  arrange(desc(total_price))
+
+print("Extreme Price Baskets:")
+head(extreme_price_baskets)
+
+
+# 2. Expensive items in small baskets (<= 3 items, max item price > $100)
+ggplot(basket_data, aes(x = total_items, y = max_price)) +
+  geom_point(alpha = 0.5, color = "darkblue") +
+  scale_y_log10(labels = label_comma()) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "darkred", linewidth = 1) +
+  geom_vline(xintercept = 3.5, linetype = "dashed", color = "darkred", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Max Item Price vs. Basket Size", 
+       subtitle = "Top-Left Box indicates Small Baskets (<= 3 items) with Expensive Items (> $100)",
+       x = "Total Items in Basket", 
+       y = "Max Price of a Single Item (Log Scale)")
+
+expensive_small_baskets <- basket_data %>%
+  filter(total_items <= 3 & max_price > 100) %>%
+  arrange(desc(max_price))
+
+print("Expensive Small Baskets:")
+head(expensive_small_baskets)
+```
+
+#### HANNES: Time-Based Anomalies
+
+```{r hannes_time_anomalies}
+# 1. Extremely fast / extremely slow scanning (< 0.5s or > 120s)
+ggplot(basket_data, aes(x = avg_time_per_item)) +
+  geom_histogram(bins = 60, fill = "lightgreen", color = "black") +
+  scale_x_log10(labels = label_comma()) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "darkred", linewidth = 1) +
+  geom_vline(xintercept = 120, linetype = "dashed", color = "darkred", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Average Scan Time per Item w/ Cutoffs (< 0.5s or > 120s)", 
+       x = "Average Time per Item (seconds, Log Scale)", 
+       y = "Frequency")
+
+extreme_time_baskets <- basket_data %>%
+  filter(avg_time_per_item < 0.5 | avg_time_per_item > 120) %>%
+  arrange(desc(avg_time_per_item))
+
+print("Extreme Time Baskets:")
+head(extreme_time_baskets)
+
+
+# 2. Checking total_time vs total_items
+ggplot(basket_data, aes(x = total_items, y = total_time)) +
+  geom_point(alpha = 0.4, color = "purple") +
+  scale_y_log10(labels = label_comma()) +
+  theme_minimal() +
+  labs(title = "Total Time vs Total Items (Log Scale)",
+       x = "Total Items",
+       y = "Total Time (seconds, Log Scale)")
+```
