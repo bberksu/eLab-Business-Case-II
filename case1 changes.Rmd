@@ -119,6 +119,42 @@ str(basket_data)
 summary(basket_data)
 ```
 
+```{r}
+stats_table <- basket_data %>%
+  select(total_items, total_price, total_time, avg_time_per_item, sd_time_per_item) %>%
+  pivot_longer(cols = everything(), names_to = "Metric", values_to = "Value") %>%
+  group_by(Metric) %>%
+  summarise(
+    Mean = mean(Value, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE),
+    P25 = quantile(Value, 0.25, na.rm = TRUE),
+    P75 = quantile(Value, 0.75, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE)
+  )
+
+stats_table <- stats_table %>%
+  mutate(Metric = recode(Metric,
+    total_items = "Number of items",
+    total_price = "Total price (€)",
+    total_time = "Total scan time (sec)",
+    avg_time_per_item = "Avg time per item (sec)",
+    sd_time_per_item = "Scan time variability"
+  ),
+  across(-Metric, ~round(.x, 2))
+  )
+
+kable(stats_table, digits = 2, align = "lrrrrrr",
+      caption = "Summary statistics of customer basket behavior") %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    bootstrap_options = c("striped", "hover", "condensed")
+  ) %>%
+  column_spec(1, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "Statistics" = 6))
+```
+
 
 
 
