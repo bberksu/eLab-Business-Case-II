@@ -1,0 +1,108 @@
+---
+title: "Pattern analysis"
+output: html_document
+date: "2026-04-19"
+---
+```{r}
+long_data <- read.csv("C:/Users/nicol/OneDrive/universita/elab 2/long_data.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+#REMOVE DUPLICATES WITHIN TRANSACTION
+dept_data <- long_data %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+#CREATE CO-OCCURRENCE PAIRS
+pairs <- dept_data %>%
+  inner_join(dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y)
+
+#COUNT PAIRS
+co_occurrence <- pairs %>%
+  count(department_name.x, department_name.y, sort = TRUE)
+
+#TOP CO-OCCURRENCE PATTERNS
+head(co_occurrence, 10)
+```
+
+```{r}
+#CO-OCCURRENCE PER DEPARTMENT
+co_by_dept <- co_occurrence %>%
+  group_by(department_name.x) %>%
+  slice_max(n, n = 10) %>%
+  ungroup()
+
+co_by_dept
+```
+
+```{r}
+#TOTAL NUMBER OF TRANSACTIONS
+total_transactions <- length(unique(long_data$transaction_id))
+
+#FREQUENCY OF EACH DEPARTMENT (PERCENTAGE OF CUSTOMERS)
+dept_freq <- dept_data %>%
+  count(department_name) %>%
+  mutate(
+    perc_total = n / total_transactions
+  )
+
+#JOIN CO-OCCURRENCE WITH DEPARTMENT FREQUENCIES
+co_occurrence_perc <- co_occurrence %>%
+  left_join(dept_freq, by = c("department_name.x" = "department_name"))
+
+#RENAME COLUMNS AND COMPUTE CONDITIONAL PROBABILITY
+co_occurrence_perc <- co_occurrence_perc %>%
+  rename(
+    pair_count = n.x,
+    dept_count = n.y,
+    dept_share = perc_total
+  ) %>%
+  mutate(
+    conditional_prob = pair_count / dept_count
+  )
+
+#VIEW TOP STRONGEST RELATIONSHIPS
+co_occurrence_perc %>%
+  arrange(desc(conditional_prob)) %>%
+  head(10)
+```
+
+```{r}
+#TOP CO-OCCURRENCE PER EACH DEPARTMENT
+co_by_dept <- co_occurrence_perc %>%
+  group_by(department_name.x) %>%
+  slice_max(conditional_prob, n = 10) %>%
+  ungroup()
+
+co_by_dept
+```
+
+```{r}
+#DEFINE EXCLUDED DEPARTMENTS
+excluded_depts <- c(
+  "Fruit & Vegetables",
+  "Books & Magazines",
+  "Care & Hygiene",
+  "Household & Pet"
+)
+
+#FILTER AND GET TOP 10 RELATIONSHIPS
+top10_filtered <- co_occurrence_perc %>%
+  filter(
+    !department_name.x %in% excluded_depts,
+    !department_name.y %in% excluded_depts
+  ) %>%
+  arrange(desc(conditional_prob)) %>%
+  slice_head(n = 10)
+
+top10_filtered
+```
+
+From the analysis, especially from the analysis based on probabilities and from the filtered analysis, some patterns emerge that appear to be random, such as Books & Magazines or Care & Hygiene with Fruit & Vegetables. These are likely due to the high number of transactions that include Fruit & Vegetables. At the same time, other combinations appear more meaningful and could be more relevant to investigate when searching for potentially fraudulent customers.
+1. Dairy & Eggs → Sauces & Spices (~80%)
+2. Cereals & Spreads → Sauces (~77%)
+3. Pasta & Rice → Sauces (~71%)
+4. Cheese & Tapas → Pasta (~74%)
+5. Meat & Fish → Pasta (~68%)
+
