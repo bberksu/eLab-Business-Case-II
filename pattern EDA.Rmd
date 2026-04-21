@@ -1,9 +1,18 @@
 ---
-title: "Pattern analysis"
-output: html_document
-date: "2026-04-19"
+title: "Pattern EDA"
+output:
+  html_document: default
+  pdf_document: default
+date: "2026-04-20"
 ---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
 ```{r}
+library(dplyr)
+library(tidyr)
 long_data <- read.csv("C:/Users/nicol/OneDrive/universita/elab 2/long_data.csv", stringsAsFactors = FALSE)
 ```
 
@@ -25,16 +34,18 @@ co_occurrence <- pairs %>%
 #TOP CO-OCCURRENCE PATTERNS
 head(co_occurrence, 10)
 ```
+After removing duplicate departments within each transaction, we generated all possible pairs of co-occurring categories and counted their frequency across all baskets. The output shows that combinations involving Fruit & Vegetables dominate, reflecting its high presence in transactions, while other frequent pairs such as Pasta & Rice with Sauces & Spices highlight more structured and complementary purchasing behavior.
 
 ```{r}
 #CO-OCCURRENCE PER DEPARTMENT
 co_by_dept <- co_occurrence %>%
   group_by(department_name.x) %>%
-  slice_max(n, n = 10) %>%
+  slice_max(n, n = 4) %>%
   ungroup()
 
 co_by_dept
 ```
+The output shows, for each department, the most frequent co-occurring categories within the same transaction. While some combinations are driven by highly frequent categories such as Fruit & Vegetables, other patterns appear more structured and meaningful, particularly those involving Pasta & Rice, Sauces & Spices, and Meat & Fish, which frequently co-occur across multiple departments. These results suggest that customers tend to purchase complementary products rather than independent items, reflecting consistent and non-random shopping behavior.
 
 ```{r}
 #TOTAL NUMBER OF TRANSACTIONS
@@ -67,12 +78,13 @@ co_occurrence_perc %>%
   arrange(desc(conditional_prob)) %>%
   head(10)
 ```
+The results show the strongest relationships between departments in terms of conditional probability, highlighting how likely a category is to be purchased given another. While combinations involving Fruit & Vegetables dominate due to its high overall presence, other relationships such as Dairy & Eggs with Sauces & Spices or Cereals & Spreads with Sauces & Spices reveal more meaningful and structured purchasing behavior, indicating that customers tend to select complementary products rather than random combinations.
 
 ```{r}
 #TOP CO-OCCURRENCE PER EACH DEPARTMENT
 co_by_dept <- co_occurrence_perc %>%
   group_by(department_name.x) %>%
-  slice_max(conditional_prob, n = 10) %>%
+  slice_max(conditional_prob, n = 5) %>%
   ungroup()
 
 co_by_dept
@@ -98,6 +110,8 @@ top10_filtered <- co_occurrence_perc %>%
 
 top10_filtered
 ```
+After excluding dominant and non-core categories, the results highlight clearer and more meaningful relationships between departments. Strong associations emerge between staple and complementary products, such as Pasta & Rice with Sauces & Spices and Dairy & Eggs with Sauces & Spices, indicating structured purchasing behavior driven by meal preparation. These patterns are more informative than the unfiltered results and provide a more reliable baseline for identifying unusual or potentially anomalous transactions.
+
 
 From the analysis, especially from the analysis based on probabilities and from the filtered analysis, some patterns emerge that appear to be random, such as Books & Magazines or Care & Hygiene with Fruit & Vegetables. These are likely due to the high number of transactions that include Fruit & Vegetables. At the same time, other combinations appear more meaningful and could be more relevant to investigate when searching for potentially fraudulent customers.
 1. Dairy & Eggs → Sauces & Spices (~80%)
@@ -105,4 +119,3 @@ From the analysis, especially from the analysis based on probabilities and from 
 3. Pasta & Rice → Sauces (~71%)
 4. Cheese & Tapas → Pasta (~74%)
 5. Meat & Fish → Pasta (~68%)
-
