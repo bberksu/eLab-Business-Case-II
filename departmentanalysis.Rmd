@@ -1,0 +1,114 @@
+---
+title: "Department & Basket Share Analysis"
+author: "Niklas"
+date: "`20-04-26`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Introduction
+
+analysis looks at shopping behaviour patterns across supermarket transactions. Identifies the most frequently visited departments and calculates what percentage of customer baskets contain items from each department.
+
+## Load Libraries & Data
+
+```{r load}
+library(dplyr)
+library(ggplot2)
+
+long_data <- read.csv("/Users/niklassandelin/Desktop/long_data.csv", stringsAsFactors = FALSE)
+
+cat("Rows:", nrow(long_data), "\n")
+cat("Columns:", paste(names(long_data), collapse = ", "), "\n")
+```
+
+## Department Basket Share
+
+A department appears in a basket if at least one item in that transaction belongs to it
+
+```{r analysis}
+total_baskets <- n_distinct(long_data$transaction_id)
+cat("Total unique baskets:", total_baskets, "\n")
+
+dept_basket_share <- long_data %>%
+  group_by(department_name) %>%
+  summarise(
+    basket_count         = n_distinct(transaction_id),
+    item_count           = n(),
+    avg_items_per_basket = round(item_count / basket_count, 2)
+  ) %>%
+  mutate(
+    basket_share_pct = round(basket_count / total_baskets * 100, 2)
+  ) %>%
+  arrange(desc(basket_share_pct))
+
+print(dept_basket_share, n = Inf)
+```
+
+## Top 10 Departments
+
+```{r top10}
+top10 <- head(dept_basket_share, 10)
+
+for (i in seq_len(nrow(top10))) {
+  cat(sprintf("  %2d. %-30s  %.1f%% of baskets\n",
+              i,
+              top10$department_name[i],
+              top10$basket_share_pct[i]))
+}
+```
+
+## Visualisations
+
+### All Departments Basket Share
+
+```{r plot-all, fig.width=10, fig.height=7}
+ggplot(dept_basket_share,
+       aes(x = reorder(department_name, basket_share_pct),
+           y = basket_share_pct)) +
+  geom_col(fill = "#2C7BB6", width = 0.7) +
+  geom_text(aes(label = paste0(basket_share_pct, "%")),
+            hjust = -0.1, size = 3.2) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, max(dept_basket_share$basket_share_pct) * 1.12),
+                     labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = "Department Presence Across Customer Baskets",
+    subtitle = paste0("n = ", format(total_baskets, big.mark = ","), " unique transactions"),
+    x        = NULL,
+    y        = "% of Baskets Containing Department"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 14),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+### Top 10 Departments
+
+```{r plot-top10, fig.width=9, fig.height=6}
+ggplot(top10,
+       aes(x = reorder(department_name, basket_share_pct),
+           y = basket_share_pct)) +
+  geom_col(fill = "#1A7340", width = 0.65) +
+  geom_text(aes(label = paste0(basket_share_pct, "%")),
+            hjust = -0.1, size = 3.5, fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, max(top10$basket_share_pct) * 1.12),
+                     labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = "Top 10 Departments by Basket Share",
+    subtitle = paste0("n = ", format(total_baskets, big.mark = ","), " unique transactions"),
+    x        = NULL,
+    y        = "% of Baskets"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 15),
+    panel.grid.major.y = element_blank()
+  )
+```
