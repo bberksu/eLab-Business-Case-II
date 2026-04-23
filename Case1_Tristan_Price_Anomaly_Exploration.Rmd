@@ -1,0 +1,562 @@
+---
+title: "Supermarket Case 1 - Price-Based Anomaly Exploration"
+author: "Tristan Kluth"
+date: "2026-04-22"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+---
+
+# Introduction
+
+This R Markdown file focuses on the **price-based anomaly exploration** for Case 1. It uses the same base structure as `case 1.Rmd` so that the workflow remains consistent with the rest of the team. The goal is not to label baskets as fraudulent, but to identify transactions that **deviate strongly from typical price-related shopping behaviour** and may therefore deserve further inspection.
+
+More specifically, this analysis looks at four types of price-related anomalies:
+
+1. **Very low or very high total basket values**
+2. **Baskets whose total value is unusual given their size**
+3. **Small baskets containing unusually expensive items**
+4. **Baskets in which one item makes up an unusually large share of total spending**
+
+These patterns can later be combined with time-based anomalies and department-level patterns to support a broader fraud-detection strategy.
+
+## Libraries
+
+As in the team base file, the analysis relies mainly on the tidyverse for data wrangling and visualization. In addition, `knitr` and `kableExtra` are used for cleaner summary tables, and `scales` helps format euro values and percentages in plots.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(hexbin)
+library(scales)
+```
+
+# 1. Raw Dataset
+
+The dataset is first read as raw text, where each row corresponds to one full transaction. This is the same starting point used in the common team file.
+
+```{r raw_data}
+# Read the raw transaction file.
+# Each line represents one basket containing multiple scanned items.
+lines <- readLines("/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/Rstudio Git/Tristan/supermarket.csv", warn = FALSE)
+
+# Create a simple raw transaction table with one row per basket.
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+head(supermarket_raw)
+```
+
+# 2. Transformation into a Structured Format
+
+The raw transaction strings are converted into a long item-level dataset. Each basket is split into separate products, and each product is decomposed into the variables `department`, `time`, and `price`.
+
+```{r parse_data}
+# Split baskets into individual item records and separate the three fields.
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price)
+  )
+
+head(long_data)
+str(long_data)
+summary(long_data)
+length(unique(long_data$transaction_id))
+```
+
+# 3. Mapping Department Codes
+
+The numeric department codes are mapped to readable product-category names so that later tables and drill-downs are easier to interpret.
+
+```{r mapping}
+# Department mapping used throughout the case.
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+# Add readable labels to the item-level data.
+long_data <- long_data %>%
+  mutate(department_name = dept_map[as.character(department)])
+
+head(long_data)
+```
+
+# 4. Data Cleaning
+
+Before moving to basket-level analysis, invalid observations are removed. This includes missing values and negative values, which should not occur in valid transaction data.
+
+```{r cleaning}
+# Keep only valid item-level observations.
+long_data_clean <- long_data %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  ) %>%
+  mutate(
+    price_per_second = ifelse(time > 0, price / time, NA_real_)
+  )
+```
+
+# 5. Basket-Level Feature Construction
+
+To detect anomalies at the transaction level, the item-level data is aggregated into basket-level features. In addition to the variables already used in your earlier work, a few extra price-based indicators are created.
+
+```{r basket_features}
+# Summarise each basket into one row with price-related and timing-related features.
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    median_price = median(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_),
+    items_per_department = ifelse(unique_departments > 0, total_items / unique_departments, NA_real_),
+    avg_price_per_item = ifelse(total_items > 0, total_price / total_items, NA_real_)
+  )
+
+head(basket_data)
+summary(basket_data)
+```
+
+# 6. Summary Statistics for Price-Related Basket Features
+
+This table gives a compact overview of the main price-related variables that will be used in the anomaly exploration.
+
+```{r price_summary_table}
+price_stats <- basket_data %>%
+  select(total_items, total_price, avg_price_per_item, max_price, max_price_share, unique_departments) %>%
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "value") %>%
+  group_by(metric) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    p25 = quantile(value, 0.25, na.rm = TRUE),
+    p75 = quantile(value, 0.75, na.rm = TRUE),
+    p95 = quantile(value, 0.95, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    metric = recode(metric,
+      total_items = "Number of items",
+      total_price = "Total basket price (€)",
+      avg_price_per_item = "Average item price (€)",
+      max_price = "Maximum item price (€)",
+      max_price_share = "Share of basket value from most expensive item",
+      unique_departments = "Unique departments"
+    ),
+    across(where(is.numeric), ~ round(.x, 2))
+  )
+
+kable(price_stats,
+      caption = "Summary statistics for key price-based basket variables",
+      booktabs = TRUE,
+      align = "lrrrrrr") %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+# 7. Price-Based Anomaly Exploration
+
+## 7.1 Very Low / Very High Total Basket Value
+
+The first step is to identify baskets with unusually low or unusually high total value. This is the most direct way to find transactions that differ from the majority of customers.
+
+Two thresholding approaches are used:
+
+- **Quantile-based thresholds**: bottom 1% and top 1%
+- **IQR-based thresholds**: the classical boxplot rule
+
+Using both makes the result more robust, because the total-price distribution is strongly right-skewed.
+
+```{r total_price_distribution}
+# Visualise total basket value in two ways:
+# 1) boxplot for outliers
+# 2) histogram on a log scale because the distribution is right-skewed
+
+ggplot(basket_data, aes(y = total_price)) +
+  geom_boxplot(fill = "skyblue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Total Basket Price",
+    subtitle = "Potential outliers are highlighted by the boxplot rule",
+    y = "Total basket price (€)"
+  )
+
+ggplot(basket_data, aes(x = total_price)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white") +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  theme_minimal() +
+  labs(
+    title = "Histogram of Total Basket Price (log scale)",
+    subtitle = "The log scale makes the long right tail easier to inspect",
+    x = "Total basket price (€, log scale)",
+    y = "Number of baskets"
+  )
+```
+
+```{r total_price_thresholds}
+# Compute two sets of anomaly thresholds for total basket value.
+price_q01 <- quantile(basket_data$total_price, 0.01, na.rm = TRUE)
+price_q99 <- quantile(basket_data$total_price, 0.99, na.rm = TRUE)
+
+price_q1  <- quantile(basket_data$total_price, 0.25, na.rm = TRUE)
+price_q3  <- quantile(basket_data$total_price, 0.75, na.rm = TRUE)
+price_iqr <- IQR(basket_data$total_price, na.rm = TRUE)
+
+price_lower_iqr <- price_q1 - 1.5 * price_iqr
+price_upper_iqr <- price_q3 + 1.5 * price_iqr
+
+price_thresholds <- tibble(
+  threshold = c("1st percentile", "99th percentile", "Lower IQR bound", "Upper IQR bound"),
+  value = c(price_q01, price_q99, price_lower_iqr, price_upper_iqr)
+)
+
+kable(price_thresholds %>% mutate(value = round(value, 2)),
+      caption = "Thresholds used to flag unusually cheap or expensive baskets",
+      booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r total_price_flags}
+# Flag baskets that are extreme in terms of total price.
+extreme_total_price_baskets <- basket_data %>%
+  mutate(
+    total_price_flag = case_when(
+      total_price <= price_q01 ~ "Very low total price (bottom 1%)",
+      total_price >= price_q99 ~ "Very high total price (top 1%)",
+      total_price < price_lower_iqr ~ "Low total price (IQR rule)",
+      total_price > price_upper_iqr ~ "High total price (IQR rule)",
+      TRUE ~ "Typical"
+    )
+  ) %>%
+  filter(total_price_flag != "Typical") %>%
+  arrange(desc(total_price))
+
+extreme_total_price_baskets %>%
+  count(total_price_flag)
+```
+
+```{r total_price_examples}
+# Show a few concrete examples of the most extreme baskets.
+head(extreme_total_price_baskets %>%
+       select(transaction_id, total_items, total_price, max_price, unique_departments, total_price_flag), 15) %>%
+  kable(caption = "Example baskets flagged for unusually low or high total value",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+### Interpretation
+
+Baskets at the very bottom or very top of the total-price distribution are interesting because they may reflect unusual behaviour, data issues, or genuine high-risk cases. However, total value alone is not enough: a very high total price can simply come from a large weekly shopping basket. Therefore, the next step is to evaluate basket value **relative to basket size**.
+
+## 7.2 Basket Value Relative to Basket Size
+
+A basket with 40 items is expected to cost more than a basket with 3 items. To account for this, the analysis now examines whether total basket value is unusual **conditional on the number of items**.
+
+This is useful because some baskets may not look extreme in absolute euros, but still stand out relative to how many items they contain.
+
+```{r price_vs_items_plot}
+# Plot the relationship between basket size and basket value.
+# A smooth trend line helps reveal the normal price pattern.
+ggplot(basket_data, aes(x = total_items, y = total_price)) +
+  geom_point(alpha = 0.15, color = "darkorange") +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "Total Basket Price versus Basket Size",
+    subtitle = "Baskets far above or below the general trend may be price anomalies",
+    x = "Number of items",
+    y = "Total basket price (€)"
+  )
+```
+
+```{r price_size_residuals}
+# Fit a simple linear benchmark model.
+# The point is not perfect prediction but to identify baskets whose value
+# is much larger or smaller than expected given the number of items.
+price_size_model <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_total_price = predict(price_size_model, newdata = basket_data),
+    price_residual = total_price - expected_total_price,
+    price_residual_z = as.numeric(scale(price_residual))
+  )
+
+summary(price_size_model)
+```
+
+```{r residual_plot}
+# Visualise the residual anomalies directly.
+# Positive residuals mean the basket is more expensive than expected.
+# Negative residuals mean the basket is cheaper than expected.
+ggplot(basket_data, aes(x = total_items, y = price_residual)) +
+  geom_point(alpha = 0.15, color = "firebrick") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = c(-2, 2) * sd(basket_data$price_residual, na.rm = TRUE),
+             linetype = "dotted", color = "grey40") +
+  theme_minimal() +
+  labs(
+    title = "Residual Basket Value after Controlling for Basket Size",
+    subtitle = "Large positive or negative residuals indicate baskets that are unusual for their size",
+    x = "Number of items",
+    y = "Residual total price (€)"
+  )
+```
+
+```{r residual_tables}
+# Flag baskets whose value is especially unusual given their size.
+residual_anomalies <- basket_data %>%
+  mutate(
+    residual_flag = case_when(
+      price_residual_z >= 3 ~ "Much more expensive than expected",
+      price_residual_z <= -3 ~ "Much cheaper than expected",
+      TRUE ~ "Typical"
+    )
+  ) %>%
+  filter(residual_flag != "Typical") %>%
+  arrange(desc(abs(price_residual_z)))
+
+head(residual_anomalies %>%
+       select(transaction_id, total_items, total_price, expected_total_price,
+              price_residual, price_residual_z, max_price, residual_flag), 15) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Baskets with unusually high or low value relative to basket size",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+### Interpretation
+
+This step is often more informative than looking only at raw basket value. For example, a small basket with a relatively high price may reflect high-value goods, while a large basket with a surprisingly low total value may indicate many low-price items, promotions, or potentially incomplete scans.
+
+## 7.3 Expensive Items in Small Baskets
+
+This was already one of your original ideas, and it is kept here in a more systematic form. The main intuition is that small baskets with a very expensive item may deserve attention because a single high-value product can dominate the transaction and may create stronger incentives for fraud.
+
+```{r expensive_item_small_baskets_plot}
+# Plot basket size against the most expensive item in the basket.
+# The baskets of interest are located in the upper-left area:
+# few items, but one unusually expensive product.
+ggplot(basket_data, aes(x = total_items, y = max_price)) +
+  geom_point(alpha = 0.35, color = "darkred") +
+  theme_minimal() +
+  labs(
+    title = "Maximum Item Price versus Basket Size",
+    subtitle = "Small baskets with very expensive items are especially interesting",
+    x = "Number of items",
+    y = "Most expensive item in basket (€)"
+  )
+```
+
+```{r expensive_item_small_baskets_flags}
+# Define a threshold for unusually expensive items using the top 5% of max item prices.
+high_price_threshold <- quantile(basket_data$max_price, 0.95, na.rm = TRUE)
+
+# Flag small baskets that contain one of these expensive items.
+expensive_small_baskets <- basket_data %>%
+  mutate(
+    expensive_small_flag = total_items <= 3 & max_price >= high_price_threshold
+  ) %>%
+  filter(expensive_small_flag) %>%
+  arrange(desc(max_price), total_items)
+
+head(expensive_small_baskets %>%
+       select(transaction_id, total_items, total_price, max_price, max_price_share,
+              avg_price_per_item, unique_departments), 15) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Small baskets containing an unusually expensive item",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+### Interpretation
+
+These baskets are not necessarily fraudulent, but they are distinct from regular baskets made up of many medium-priced grocery items. They may be particularly relevant for targeted checks because the transaction depends heavily on one or two expensive products.
+
+## 7.4 Price Concentration: One Item Dominates the Basket
+
+A basket may also be suspicious when one item accounts for a very large share of the total basket value. This is slightly different from the previous analysis: even a basket with several items can still be highly concentrated if almost all spending comes from one product.
+
+```{r price_concentration_plot}
+# Plot how much of the basket value comes from the single most expensive item.
+ggplot(basket_data, aes(x = max_price_share)) +
+  geom_histogram(bins = 50, fill = "darkgreen", color = "white") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Max-Item Share in Basket Value",
+    subtitle = "Higher values indicate baskets dominated by one expensive item",
+    x = "Share of total basket value from the most expensive item",
+    y = "Number of baskets"
+  )
+```
+
+```{r price_concentration_flags}
+# Use the 95th percentile to flag unusually concentrated baskets.
+concentration_threshold <- quantile(basket_data$max_price_share, 0.95, na.rm = TRUE)
+
+concentrated_baskets <- basket_data %>%
+  filter(max_price_share >= concentration_threshold) %>%
+  arrange(desc(max_price_share), desc(max_price))
+
+head(concentrated_baskets %>%
+       select(transaction_id, total_items, total_price, max_price, max_price_share,
+              avg_price_per_item, unique_departments), 15) %>%
+  mutate(
+    max_price_share = percent(max_price_share, accuracy = 0.1),
+    across(c(total_price, max_price, avg_price_per_item), ~ round(.x, 2))
+  ) %>%
+  kable(caption = "Baskets where one item dominates total basket value",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+### Interpretation
+
+Highly concentrated baskets can matter operationally because a missed scan of one expensive item would strongly affect the total transaction value. That does not prove fraud, but it makes such baskets relevant for risk prioritization.
+
+## 7.5 Combining Price Signals into a Candidate Risk Score
+
+A single anomaly flag can be informative, but baskets that trigger **multiple** price-based anomaly signals are more interesting than baskets that trigger only one. To make this concrete, a simple rule-based score is created.
+
+This is not meant to be a final fraud model. It is only a transparent way to rank baskets for exploratory purposes.
+
+```{r combined_price_score}
+# Combine the main price anomaly signals into one transparent score.
+# Each triggered flag contributes one point.
+price_anomaly_candidates <- basket_data %>%
+  mutate(
+    flag_extreme_total_price = total_price <= price_q01 | total_price >= price_q99,
+    flag_price_size_residual = abs(price_residual_z) >= 3,
+    flag_expensive_small = total_items <= 3 & max_price >= high_price_threshold,
+    flag_concentrated = max_price_share >= concentration_threshold,
+    price_anomaly_score =
+      as.integer(flag_extreme_total_price) +
+      as.integer(flag_price_size_residual) +
+      as.integer(flag_expensive_small) +
+      as.integer(flag_concentrated)
+  ) %>%
+  arrange(desc(price_anomaly_score), desc(total_price), desc(max_price))
+
+price_anomaly_candidates %>%
+  count(price_anomaly_score) %>%
+  kable(caption = "Distribution of combined price-based anomaly scores",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r top_candidates_table}
+# Inspect the top-ranked baskets according to the rule-based price anomaly score.
+head(price_anomaly_candidates %>%
+       filter(price_anomaly_score >= 2) %>%
+       select(transaction_id, total_items, total_price, expected_total_price,
+              price_residual_z, max_price, max_price_share,
+              unique_departments, price_anomaly_score), 20) %>%
+  mutate(
+    across(c(total_price, expected_total_price, price_residual_z, max_price), ~ round(.x, 2)),
+    max_price_share = percent(max_price_share, accuracy = 0.1)
+  ) %>%
+  kable(caption = "Top candidate baskets based on multiple price anomaly signals",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+# 8. Drill-Down: Item Composition of Top Candidate Baskets
+
+Once the strongest candidate baskets have been identified, it is useful to inspect which concrete items or departments make them unusual. The code below extracts the item-level records for the top price-anomaly baskets.
+
+```{r drill_down_candidates}
+# Select a few of the strongest candidate baskets for manual inspection.
+top_candidate_ids <- price_anomaly_candidates %>%
+  filter(price_anomaly_score >= 2) %>%
+  slice_head(n = 10) %>%
+  pull(transaction_id)
+
+candidate_item_view <- long_data_clean %>%
+  filter(transaction_id %in% top_candidate_ids) %>%
+  arrange(transaction_id, desc(price)) %>%
+  select(transaction_id, department_name, time, price)
+
+head(candidate_item_view, 30) %>%
+  kable(caption = "Item-level drill-down for selected top candidate baskets",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+# 9. Conclusion
+
+The price-based anomaly exploration shows that most baskets follow a fairly regular pattern, but a smaller subset stands out clearly.
+
+The main findings are:
+
+- Some baskets are **extremely cheap or extremely expensive** compared with the overall distribution.
+- Some baskets have a **total value that is unusual for their number of items**, which is often more informative than absolute price alone.
+- A number of **small baskets contain unusually expensive items**, making them operationally relevant for spot checks.
+- In some baskets, **one item dominates the total basket value**, meaning that a single missed scan would have a large monetary effect.
+- Baskets that trigger **multiple price anomaly signals at once** are strong candidates for further investigation.
+
+Overall, these results do not prove fraud directly. However, they help define which baskets differ most from normal customer behaviour and therefore provide a useful input for later fraud-risk scoring, manual inspections, or combined models that also include timing and department-based features.
+
+# 10. Optional Next Step
+
+A natural next step would be to merge this price-based work with Hannes' time-based anomaly indicators. That would allow the team to test whether baskets that are unusual in **both** price and timing dimensions form especially strong candidates for a first prototype risk-flagging system.
