@@ -1,0 +1,159 @@
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(hexbin)
+
+### 1. Initialization & Base Cleaning
+
+lines <- readLines("~/Downloads/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price)
+  )
+
+dept_map <- c(
+  "1" = "Bakery & Pastry", "2" = "Beer & Wine", "3" = "Books & Magazines",
+  "4" = "Candy & Chips", "5" = "Care & Hygiene", "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas", "8" = "Dairy & Eggs", "9" = "Freezer",
+  "10" = "Fruit & Vegetables", "11" = "Household & Pet", "12" = "Meat & Fish",
+  "13" = "Pasta & Rice", "14" = "Salads & Meals", "15" = "Sauces & Spices",
+  "16" = "Soda & Juices", "17" = "Special Diet", "18" = "Vegetarian & Vegan"
+)
+
+long_data_clean <- long_data %>%
+  mutate(department_name = dept_map[as.character(department)]) %>%
+  filter(!is.na(department), !is.na(time), !is.na(price))
+
+### 2. Summary Aggregation
+
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = total_time / total_items,
+    max_time = max(time, na.rm = TRUE),
+    max_price = max(price),
+    min_price = min(price),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_time_share = ifelse(total_time > 0, max_time / total_time, NA_real_)
+  )
+
+### 3. Time Anomaly Exploration
+
+time_size_model <- lm(total_time ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_total_time = predict(time_size_model, newdata = basket_data),
+    time_residual = total_time - expected_total_time,
+    time_residual_z = as.numeric(scale(time_residual)) 
+  )
+
+ggplot(basket_data, aes(x = total_items, y = time_residual)) +
+  geom_point(alpha = 0.15, color = "purple") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 3 * sd(basket_data$time_residual, na.rm = TRUE),
+             linetype = "dotted", color = "darkred", linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "Residual Shopping Time after Controlling for Basket Size",
+    subtitle = "Dots above the red line represent baskets taking significantly longer than expected",
+    x = "Number of items",
+    y = "Residual Total Time (seconds)"
+  )
+
+ggplot(basket_data, aes(x = max_time_share)) +
+  geom_histogram(bins = 50, fill = "lightgreen", color = "black") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Max-Item Share in Total Shopping Time",
+    subtitle = "Values near 100% mean almost the entire trip was spent on one item",
+    x = "Share of total time spent on the longest item",
+    y = "Frequency"
+  )
+
+time_concentration_threshold <- quantile(basket_data$max_time_share, 0.95, na.rm = TRUE)
+
+time_anomaly_candidates <- basket_data %>%
+  mutate(
+    flag_extreme_slow = avg_time_per_item > 300,
+    flag_time_size_residual = time_residual_z >= 3,
+    flag_time_concentrated = max_time_share >= time_concentration_threshold,
+    time_anomaly_score = as.integer(flag_extreme_slow) + 
+      as.integer(flag_time_size_residual) + 
+      as.integer(flag_time_concentrated)
+  ) %>%
+  arrange(desc(time_anomaly_score), desc(total_time))
+
+print("Top Time Anomaly Candidates:")
+head(time_anomaly_candidates %>% 
+       filter(time_anomaly_score >= 2) %>% 
+       select(transaction_id, total_items, total_time, avg_time_per_item, max_time_share, time_anomaly_score), 10)
+
+### 4. Applying Hard Cutoffs (Filtered Data)
+
+final_cleaned_baskets <- basket_data %>%
+  filter(
+    avg_time_per_item <= 300
+  )
+
+print("--- Data Cleaning Summary ---")
+print(paste("Original transactions:", nrow(basket_data)))
+print(paste("Cleaned transactions:", nrow(final_cleaned_baskets)))
+print(paste("Anomalies removed:", nrow(basket_data) - nrow(final_cleaned_baskets)))
+
+print("--- Post-Cleaning Statistics ---")
+summary(final_cleaned_baskets %>% select(total_items, total_time, avg_time_per_item, max_time_share))
+
+### 5. Visualizing the Filtered Data
+
+ggplot(final_cleaned_baskets, aes(y = avg_time_per_item)) +
+  geom_boxplot(fill = "lightgreen", outlier.color = "black", outlier.shape = 16) +
+  scale_y_log10(labels = label_comma()) +
+  theme_minimal() +
+  labs(title = "FILTERED: Average Time per Item", 
+       subtitle = "Upper bound anomaly threshold (> 300s) applied",
+       y = "Average Time per Item (seconds, Log Scale)")
+
+ggplot(final_cleaned_baskets, aes(x = avg_time_per_item)) +
+  geom_histogram(bins = 60, fill = "lightgreen", color = "black") +
+  scale_x_log10(labels = label_comma()) +
+  theme_minimal() +
+  labs(title = "FILTERED: Frequency of Average Time per Item", 
+       x = "Average Time per Item (seconds, Log Scale)", 
+       y = "Frequency")
+
+ggplot(final_cleaned_baskets, aes(x = total_items, y = total_time)) +
+  geom_point(alpha = 0.4, color = "purple") +
+  scale_y_log10(labels = label_comma()) +
+  theme_minimal() +
+  labs(title = "FILTERED: Total Time vs Total Items",
+       subtitle = "The extreme vertical outliers have been successfully removed",
+       x = "Total Items",
+       y = "Total Time (seconds, Log Scale)")
