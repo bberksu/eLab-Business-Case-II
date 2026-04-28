@@ -1,0 +1,2750 @@
+---
+title: "EDA AH Fraud Detection"
+output:
+  pdf_document:
+    latex_engine: xelatex
+date: "2026-04-17"
+---
+# Exploratory Data Analysis
+
+## Libraries 
+
+The analysis uses the tidyverse for data manipulation and visualization, knitr and kableExtra for table formatting in the report, and hexbin for density-based visualizations (hexagonal binning).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(hexbin)
+library(scales)
+library(isotree)
+library(dplyr)
+```
+ 
+## Raw Dataset
+
+The dataset is read as raw text using readLines(), where each line represents a single transaction. A tibble is then created with a unique transaction_id for each row and a basket column containing the raw transaction string. The head() function is used to inspect the first observations.
+ 
+```{r}
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+head(supermarket_raw)
+```
+
+## Transfotmation into a structured format 
+
+The raw transaction strings are transformed into a structured format. Each basket is split into individual product entries, and each entry is further separated into department, time (between scans), and price. These variables are then converted to numeric types. Finally, the data is inspected using head(), structure, summary statistics, and a check of unique transaction IDs.
+
+```{r}
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price)
+  )
+
+head(long_data)
+str(long_data)
+summary(long_data)
+length(unique(long_data$transaction_id))
+```
+
+The dataset contains over 2.1 million item-level observations across 100,000 transactions.
+
+The distribution of time between scans is right-skewed, with a median of 60 seconds but extreme values reaching up to 2,420 seconds, indicating the presence of long pauses.
+
+Price distribution is also right-skewed, with most items priced around €2, but occasional high-value purchases.
+
+Additionally, approximately 5% of the data contains missing values, which requires further data cleaning.
+
+## Mapping
+
+A mapping is created to translate numerical department codes into descriptive category names, then applied to the dataset, adding a new variable (department_name) that improves interpretability. The updated data is inspected using head().
+
+```{r}
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- long_data %>%
+  mutate(department_name = dept_map[as.character(department)])
+
+head(long_data)
+```
+
+Numeric department codes were mapped to descriptive category names. This transformation allows for a more meaningful analysis of customer purchasing behavior, enabling comparisons across product categories and identification of common shopping patterns.
+
+## Data Cleaning
+
+The dataset is cleaned by removing observations with missing or invalid values (for example, NA, negative time or price). A new variable, price_per_second, is then created to capture the ratio of price to time between scans, serving as an additional behavioral feature.
+
+```{r}
+long_data_clean <- long_data %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  ) %>%
+  mutate(
+    price_per_second = ifelse(time > 0, price / time, NA_real_)
+  )
+```
+
+## Descriptive Analysis of Basket Characteristics
+
+The data is aggregated at the transaction level, turning item-level data into basket-level features. For each transaction, key metrics are calculated, including basket size (total_items), total and average price, total and average time between scans, variability measures, and price-related indicators. The number of unique departments is also included.
+
+The resulting dataset is then checked using basic outputs such as head(), structure, and summary statistics.
+
+```{r}
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+head(basket_data)
+str(basket_data)
+summary(basket_data)
+```
+
+## Summary Statistic Table 
+
+A summary statistics table is created for the main basket-level variables. The selected variables are reshaped into long format, grouped by metric, and summarized using mean, median, standard deviation, selected percentiles, and maximum values. The metric names are then relabeled for readability, numeric values are rounded, and the final table is formatted using kable and kableExtra for clear presentation in the report.
+
+```{r}
+stats_table <- basket_data %>%
+  select(total_items, total_price, total_time, avg_time_per_item, sd_time_per_item) %>%
+  pivot_longer(cols = everything(), names_to = "Metric", values_to = "Value") %>%
+  group_by(Metric) %>%
+  summarise(
+    Mean = mean(Value, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE),
+    P25 = quantile(Value, 0.25, na.rm = TRUE),
+    P75 = quantile(Value, 0.75, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE)
+  )
+
+stats_table <- stats_table %>%
+  mutate(Metric = recode(Metric,
+    total_items = "Number of items",
+    total_price = "Total price (€)",
+    total_time = "Total scan time (sec)",
+    avg_time_per_item = "Avg time per item (sec)",
+    sd_time_per_item = "Scan time variability"
+  ),
+  across(-Metric, ~round(.x, 2))
+  )
+
+kable(stats_table, digits = 2, align = "lrrrrrr",
+      caption = "Summary statistics of customer basket behavior", booktabs = TRUE) %>%
+  kable_styling(
+    latex_options = c("hold_position", "striped"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  column_spec(1, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "Statistics" = 6))
+```
+
+The typical customer basket contains around 19-20 items, with total spending around €48.6. The distribution of total price is right-skewed, meaning there are some higher-value transactions.
+
+Customers spend about 30 minutes per shopping session, with most trips lasting between 23 and 42 minutes.
+
+The average time per item is relatively high (around 99 seconds), and there is quite a lot of variation within baskets. This suggests that customers do not scan items continuously, but take pauses as part of the shopping process.
+
+Finally, the presence of extreme values in time-related variables points to outliers, such as very long pauses or possibly unclosed sessions.
+
+# Basket Analysis
+
+## Basket Size
+
+The distribution of basket size is right-skewed, with most customers buying a moderate number of items and a long tail of larger baskets. The median basket contains 19 items, while the mean is slightly higher at 20.3, pulled up by those larger shopping trips. The middle 50% of customers buy between 13 and 25 items (IQR), which can be considered the "normal" basket size range. The boxplot confirms this, with outliers stretching up to 108 items, which are likely bulk purchases or large household shopping trips.
+For the typical customer, a normal basket contains roughly 13-25 items, with 19 being the most representative single value.
+
+## Total Basket Value (Spending Range)
+
+Spending follows a similar right-skewed pattern. The median spend is €48.56, meaning half of all customers spend less than €50 per trip. The interquartile range runs from €31.68 to €74.92, capturing the core spending behaviour of most customers. There are notable high-value outliers reaching up to €409, but these are rare. The vast majority of baskets fall well below €150 as seen in both the following histogram and boxplot .
+A typical customer spends between €32 and €75, with €49 being a strong central estimate.
+
+### Distribution of Basket Size 
+
+```{r}
+ggplot(basket_data, aes(x = total_items)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 binwidth = 2,
+                 fill = "lightblue",
+                 color = "white",
+                 alpha = 0.8) +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(aes(xintercept = median(total_items)),
+             linetype = "dashed",
+             linewidth = 1) +
+  labs(
+    title = "Distribution of basket size",
+    subtitle = "Dashed line indicates median",
+    x = "Number of items",
+    y = "Density"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The distribution peaks around 15-20 items and then gradually tapers off to the right. It is clearly right-skewed and the bulk of customers cluster in the 10-30 item range, but a long tail extends toward 60-90+ items. This tells you that the "typical" shopper buys a moderate amount, while very large baskets are uncommon but do exist.
+
+### Distribution of Total Basket Value
+
+```{r}
+ggplot(basket_data, aes(x = total_price)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 40,
+                 fill = "pink",
+                 color = "white",
+                 alpha = 0.8) +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(aes(xintercept = median(total_price, na.rm = TRUE)),
+             linetype = "dashed",
+             linewidth = 1) +
+  coord_cartesian(
+    xlim = c(0, quantile(basket_data$total_price, 0.99, na.rm = TRUE))
+  ) +
+  labs(
+    title = "Distribution of total basket value",
+    subtitle = "Top 1% of extreme values hidden for readability; dashed line indicates median",
+    x = "Total price (€)",
+    y = "Density"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggplot(basket_data, aes(x = total_price)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 40,
+                 fill = "pink",
+                 color = "white",
+                 alpha = 0.8) +
+  labs(title = "Distribution of total basket value", x = "Total Price (€)", y = "Count") +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Spending is also right-skewed, peaking around €20–€35 and taking off steeply after €100. The long tail reaching €400 represents rare high-spending trips. The shape is more extreme than the basket size histogram which means spending inequality between customers is even more pronounced than item count differences.
+
+### Boxplots of Basket Size and Total Basket Value
+
+```{r}
+ggplot(basket_data, aes(y = total_items)) +
+  geom_boxplot(fill = "lavender", alpha = 0.7, outlier.alpha = 0.2) +
+  labs(
+    title = "Distribution of Basket Size",
+    y = "Number of items"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+The box (IQR) sits between roughly 13 and 25 items, with the median line at 19. The whiskers extend to about 3–42 items, and everything beyond that is flagged as an outlier. There are many outlier points stretching up to 108, but the box itself is compact, confirming that most customers behave similarly and extreme basket sizes are genuinely unusual, not just rare.
+
+```{r}
+ggplot(basket_data, aes(y = total_price)) +
+  geom_boxplot(fill = "lightyellow", alpha = 0.7, outlier.alpha = 0.2) +
+  labs(
+    title = "Distribution of Total Basket Value",
+    y = "Total price (€)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+The box spans roughly €32 to €75, with the median around €49. The upper whisker reaches approx. €140, and beyond that there is a very dense cluster of outliers all the way to €409. Notably, the outlier column is much denser here than in the basket size boxplot which means high spending is more common as an anomaly than having a very large basket. Some customers spend disproportionately even without buying unusually many items, likely due to expensive products.
+
+### Relationship Between Basket Size and Total Spend
+
+```{r}
+ggplot(basket_data, aes(x = total_items, y = total_price)) +
+  geom_hex(bins = 35) +
+  geom_smooth(aes(color = "Linear trend (LM)"),
+              method = "lm",
+              linetype = "dashed",
+              se = FALSE) +
+  scale_color_manual(
+    values = c("Linear trend (LM)" = "red"),
+    name = "Trend type"
+  ) +
+  scale_fill_viridis_c(name = "Count") +
+  labs(
+    title = "Relationship between basket size and total spend",
+    subtitle = "Hexagonal density plot with linear trend",
+    x = "Number of items",
+    y = "Total price (€)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+There is a clear positive linear relationship: as the number of items increases, total spend increases. The trend line confirms this. However, the spread of points fans out as basket size grows, meaning large baskets are less predictable in value. Some customers with 50+ items spend relatively little (cheap items), while others spend a lot. For small baskets (under 20 items), spending is tight and predictable.
+
+## Time Behavior
+
+### Total Scan Time
+#### Distruibutions
+
+To analyze time behavior at the basket level, extreme values in total scan time are removed by excluding the top 1% of transactions. The filtered data is then used to plot the distribution of total scan time using a histogram, a density curve, and a median reference line. A second histogram on a log scale is included to better show the skewness and overall spread of the data.
+
+```{r}
+basket_time_filtered <- basket_data %>%
+  filter(total_time < quantile(total_time, 0.99, na.rm = TRUE))
+
+median_time <- median(basket_time_filtered$total_time, na.rm = TRUE)
+
+ggplot(basket_time_filtered, aes(x = total_time)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 50,
+    fill = "lightblue",
+    color = "white",
+    alpha = 0.7
+  ) +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(
+    xintercept = median_time,
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Distribution of total scan time",
+    subtitle = "Top 1% of extreme transactions removed; dashed line indicates median",
+    x = "Total scan time (seconds)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+
+ggplot(basket_time_filtered, aes(x = total_time)) +
+  geom_histogram(bins = 50, fill = "darkblue", color = "white") +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of total scan time (log scale)",
+    x = "Total scan time (log10 scale)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The distribution of total scan time is unimodal and right-skewed, with a clear peak around 1,500–2,000 seconds. The median transaction duration is about 30 minutes, which reflects a typical shopping session.
+
+Even after removing the top 1% of extreme values, the distribution still has a long right tail, showing that shopping time varies quite a lot. Most customers finish within roughly 17 to 40 minutes, but some take much longer, likely due to pauses or different shopping habits.
+
+When using a log scale, the distribution becomes more symmetric. This suggests that total scan time follows a log-normal pattern, meaning it is influenced by several factors at once, such as basket size, scanning speed, and pauses between items. The log transformation also makes the central pattern easier to see by reducing the impact of extreme values.
+
+Overall, this indicates that using log-transformed time variables could be more useful for further analysis and modeling.
+
+#### Quantiles
+
+Key percentiles of total scan time (25th, 50th, 75th, and 95th) are calculated to better understand how transaction durations are distributed. These values help show the typical range of shopping time and highlight longer transactions in the upper part of the distribution.
+
+```{r}
+time_quantiles <- quantile(
+  basket_time_filtered$total_time,
+  probs = c(0.25, 0.5, 0.75, 0.95),
+  na.rm = TRUE
+)
+
+time_quantiles
+```
+
+The distribution of total scan time shows that half of all transactions are completed in about 31 minutes, and 75% finish within 41 minutes.
+
+Most shopping trips fall in the 23 to 41 minute range, which reflects typical behavior. However, the 95th percentile exceeds 60 minutes, showing that there is still quite a bit of variation.
+
+This means that while most customers shop in a fairly consistent way, a smaller group takes much longer, likely due to pauses or more complex shopping trips.
+
+### Scanning Pace (average time)
+#### Distributions
+
+To analyze scanning pace, extreme values in average time between scans are removed by excluding the top 1% of observations. The filtered data is then used to plot the distribution with a histogram, a density curve, and a median reference line. This helps show the typical scanning behavior as well as how much it varies across transactions.
+
+```{r}
+basket_speed_filtered <- basket_data %>%
+  filter(avg_time_per_item < quantile(avg_time_per_item, 0.99, na.rm = TRUE))
+
+median_speed <- median(basket_speed_filtered$avg_time_per_item, na.rm = TRUE)
+
+ggplot(basket_speed_filtered, aes(x = avg_time_per_item)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 50,
+    fill = "pink",
+    color = "white",
+    alpha = 0.7
+  ) +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(
+    xintercept = median_speed,
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Distribution of average time between scans",
+    subtitle = "Top 1% removed; dashed line indicates median",
+    x = "Average time between scans (seconds)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+ggplot(basket_speed_filtered, aes(x = avg_time_per_item)) +
+  geom_histogram(
+    bins = 50,
+    fill = "darkblue",
+    color = "white",
+    alpha = 0.8
+  ) +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of average time between scans (log scale)",
+    subtitle = "Log scale reduces the influence of the right tail",
+    x = "Average time between scans (log10 scale)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The distribution of average time between scans is unimodal and right-skewed, with a clear peak around 80-100 seconds. The median of about 95-100 seconds suggests that customers do not scan items continuously, but take pauses between scans as part of the shopping process.
+
+Most transactions fall within the range of 70 to 130 seconds per item, which reflects typical behavior. However, the long right tail indicates that some customers take much longer between scans, likely due to interruptions or slower shopping patterns.
+
+The log-scale version makes the central part of the distribution easier to interpret by reducing the visual influence of the long right tail. Compared with total scan time, the skewness is less extreme because average time per item is already normalized by basket size.
+
+Overall, this shows that average time per item is not just a measure of scanning speed, but a behavioral indicator of how customers move through the store. Average time per item is not only a measure of scanning speed, but also a behavioral indicator of how customers move through the store. The original scale is more intuitive for business interpretation, while the log-transformed version may be more useful for further statistical analysis or modeling.
+
+#### Quantiles
+
+Key percentiles of the average time between scans (25th, 50th, 75th, and 95th) are calculated to better understand how scanning pace is distributed. These values help show the typical range of behavior and highlight slower scanning patterns in the upper part of the distribution.
+
+```{r}
+speed_quantiles <- quantile(
+  basket_speed_filtered$avg_time_per_item,
+  probs = c(0.25, 0.5, 0.75, 0.95),
+  na.rm = TRUE
+)
+
+speed_quantiles
+```
+
+The distribution of average time between scans shows that half of all transactions are completed in about 99 seconds per item, with most falling between 81 and 122 seconds. This relatively narrow range suggests that scanning behavior is quite consistent for most customers.
+
+However, the upper tail reaches around 169 seconds at the 95th percentile, indicating that some customers take much longer between scans, likely due to pauses or interruptions.
+
+These patterns make it possible to distinguish between fast, typical, and slower scanning customers.
+
+## Average time between scans vs Basket size
+### LOESS
+
+The relationship between basket size and scanning pace is explored using scatter plots with a LOESS smoothing line. The full dataset gives an overall view, while a random sample of 5,000 transactions makes the plot easier to read.
+
+The trend line shows how the average time between scans changes with the number of items, helping to reveal any non-linear patterns in customer behavior.
+
+```{r}
+#loess
+ggplot(basket_speed_filtered, aes(x = total_items, y = avg_time_per_item)) +
+  geom_point(alpha = 0.2, size = 1) +
+  geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 1) +
+  labs(
+    title = "Average time between scans vs Basket size",
+    subtitle = "Trend line shows how average scan intervals vary with basket size",
+    x = "Number of items",
+    y = "Average time between scans (seconds)"
+  ) +
+  theme_minimal(base_family = "serif") +
+    theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+#sample 5,000
+
+set.seed(123)
+
+basket_sample <- basket_speed_filtered %>%
+  slice_sample(n = 5000)
+
+ggplot(basket_sample, aes(x = total_items, y = avg_time_per_item)) +
+  geom_point(alpha = 0.2, size = 1) +
+  geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 1) +
+  labs(
+    title = "Average time between scans vs Basket size",
+    subtitle = "Based on a random sample of 5,000 transactions",
+    x = "Number of items",
+    y = "Average time between scans (seconds)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The relationship between basket size and average time between scans is not linear.
+
+For small baskets, customers are slower, often taking more than 120 seconds per item, likely because they are browsing or deciding what to buy.
+
+As basket size increases, the average time per item decreases to around 85-100 seconds, suggesting that customers get into a more consistent shopping rhythm.
+
+For very large baskets, the pattern levels off and slightly increases, which could be due to fatigue or more complex shopping.
+
+Overall, this shows that scanning speed is not constant, but depends on basket size.
+
+### Scanning Behavior
+
+Scanning behavior is further explored by comparing small and large baskets, showing clear differences in how the average time between scans is distributed. 
+
+In addition, the relationship between basket size and scanning pace is examined using the median and interquartile range, which helps show how both the typical value and the variability of scan intervals change as the number of items increases.
+
+```{r}
+basket_speed_filtered %>%
+  mutate(size_group = ifelse(total_items <= 10, "Small basket", "Large basket")) %>%
+  ggplot(aes(x = avg_time_per_item, fill = size_group)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Average time between scans by basket size",
+    subtitle = "Comparison of small and large baskets",
+    x = "Average time between scans (seconds)",
+    y = "Density",
+    fill = "Basket type"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+basket_speed_filtered %>%
+  group_by(total_items) %>%
+  summarise(
+    n = n(),
+    q25 = quantile(avg_time_per_item, 0.25, na.rm = TRUE),
+    q50 = median(avg_time_per_item, na.rm = TRUE),
+    q75 = quantile(avg_time_per_item, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 30) %>%
+  ggplot(aes(x = total_items)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.3, fill = "#E8A0BF") +
+  geom_line(aes(y = q50), color = "red", linewidth = 1) +
+  labs(
+    title = "Distribution of average time between scans by basket size",
+    subtitle = "Line shows the median; shaded area shows the interquartile range",
+    x = "Number of items",
+    y = "Average time between scans (seconds)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The comparison between small and large baskets shows clear differences in scanning behavior.
+
+Small baskets have a wider spread and higher variability in the time between scans, suggesting more exploratory and less structured shopping. In contrast, large baskets are more concentrated around 80–100 seconds, indicating more consistent and efficient behavior.
+
+Looking at basket size more closely, the average time per item drops quickly for small baskets, then stabilizes for medium-sized ones, and slightly increases again for very large baskets. At the same time, variability decreases as basket size grows, meaning behavior becomes more predictable in larger transactions.
+
+### Density
+
+A hexbin plot is used to show how observations are distributed across basket size and average time between scans. Instead of plotting individual points, the data is grouped into hexagonal bins, making it easier to see where most transactions are concentrated and where less common patterns occur.
+
+```{r}
+ggplot(basket_speed_filtered, aes(x = total_items, y = avg_time_per_item)) +
+  geom_hex(bins = 40) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Density of average time between scans vs basket size",
+    x = "Number of items",
+    y = "Average time between scans (seconds)",
+    fill = "Density"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The density plot shows a clear concentration of observations for baskets with 10 to 30 items, where average scan times are around 80 to 110 seconds per item. This represents typical customer behavior.
+
+There is a negative relationship between basket size and average time per item, meaning that customers become more efficient as the number of items increases. At the same time, variability decreases with basket size, suggesting that larger baskets are associated with more consistent and structured shopping.
+
+Very slow scan times are mostly found in small baskets, likely reflecting browsing rather than inefficiency.
+
+To sum up, these results show that scanning behavior depends on basket size and should be taken into account when analyzing behavior and detecting unusual patterns.
+
+
+
+
+
+
+
+# DEPARTMENTS
+
+## Introduction
+
+Analysis looks at shopping behaviour patterns across supermarket transactions. Identifies the most frequently visited departments and calculates what percentage of customer baskets contain items from each department.
+
+## Department Basket Share
+
+A department appears in a basket if at least one item in that transaction belongs to it
+
+```{r analysis}
+total_baskets <- n_distinct(long_data_clean$transaction_id)
+
+cat("Total unique baskets:", total_baskets, "\n")
+
+dept_basket_share <- long_data_clean %>%
+  group_by(department_name) %>%
+  summarise(
+    basket_count = n_distinct(transaction_id),   # в скольких корзинах есть департамент
+    item_count   = n(),                          # сколько всего товаров этого департамента
+    avg_items_per_basket = round(item_count / basket_count, 2),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    basket_share_pct = round(basket_count / total_baskets * 100, 2)
+  ) %>%
+  arrange(desc(basket_share_pct))
+
+print(dept_basket_share, n = Inf)
+```
+
+## Top 10 Departments
+
+```{r top10}
+top10 <- dept_basket_share %>%
+  slice_head(n = 10)
+
+cat("Top 10 departments by basket share:\n\n")
+
+for (i in seq_len(nrow(top10))) {
+  cat(sprintf(
+    "%2d. %-25s %6.2f%% of baskets\n",
+    i,
+    top10$department_name[i],
+    top10$basket_share_pct[i]
+  ))
+}
+```
+
+## Visualisations
+
+### All Departments Basket Share
+
+```{r plot-all}
+ggplot(dept_basket_share,
+       aes(x = reorder(department_name, basket_share_pct),
+           y = basket_share_pct)) +
+  geom_col(
+    fill = "#A7C7E7",
+    color = "#2C3E50",
+    width = 0.7,
+    alpha = 0.85
+  ) +
+  geom_text(
+    aes(label = paste0(basket_share_pct, "%")),
+    hjust = -0.1,
+    size = 3.2,
+    family = "serif"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, max(dept_basket_share$basket_share_pct, na.rm = TRUE) * 1.12),
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    title = "Department Presence Across Customer Baskets",
+    subtitle = paste0("n = ", format(total_baskets, big.mark = ","), " unique transactions"),
+    x = NULL,
+    y = "% of baskets containing department"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Top 10 Departments
+
+```{r plot-top10}
+ggplot(top10,
+       aes(x = reorder(department_name, basket_share_pct),
+           y = basket_share_pct)) +
+  geom_col(
+    fill = "#1A7340",
+    color = "#2C3E50",
+    width = 0.65,
+    alpha = 0.9
+  ) +
+  geom_text(
+    aes(label = paste0(basket_share_pct, "%")),
+    hjust = -0.1,
+    size = 3.5,
+    family = "serif",
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, max(top10$basket_share_pct, na.rm = TRUE) * 1.12),
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    title = "Top 10 Departments by Basket Share",
+    subtitle = paste0("n = ", format(total_baskets, big.mark = ","), " unique transactions"),
+    x = NULL,
+    y = "% of baskets containing department"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+```{r}
+# REMOVE DUPLICATES WITHIN TRANSACTION
+dept_data <- long_data_clean %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+# CREATE CO-OCCURRENCE PAIRS
+pairs <- dept_data %>%
+  inner_join(dept_data, by = "transaction_id") %>%
+  filter(department_name.x != department_name.y) %>%
+  mutate(
+    dept_1 = pmin(department_name.x, department_name.y),
+    dept_2 = pmax(department_name.x, department_name.y)
+  ) %>%
+  distinct(transaction_id, dept_1, dept_2)
+
+# COUNT PAIRS
+co_occurrence <- pairs %>%
+  count(dept_1, dept_2, sort = TRUE)
+
+head(co_occurrence, 10)
+```
+We generated all possible pairs of co-occurring categories and counted their frequency across all baskets. The output shows that combinations involving Fruit & Vegetables dominate, reflecting its high presence in transactions, while other frequent pairs such as Pasta & Rice with Sauces & Spices highlight more structured and complementary purchasing behavior.
+
+```{r}
+#CO-OCCURRENCE PER DEPARTMENT
+co_by_dept <- bind_rows(
+  co_occurrence %>%
+    transmute(
+      department = dept_1,
+      partner = dept_2,
+      n = n
+    ),
+  co_occurrence %>%
+    transmute(
+      department = dept_2,
+      partner = dept_1,
+      n = n
+    )
+) %>%
+  group_by(department) %>%
+  slice_max(order_by = n, n = 4, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(department, desc(n))
+
+co_by_dept
+```
+The output shows, for each department, the most frequent co-occurring categories within the same transaction. While some combinations are driven by highly frequent categories such as Fruit & Vegetables, other patterns appear more structured and meaningful, particularly those involving Pasta & Rice, Sauces & Spices, and Meat & Fish, which frequently co-occur across multiple departments. These results suggest that customers tend to purchase complementary products rather than independent items, reflecting consistent and non-random shopping behavior.
+
+```{r}
+library(tidyr)
+
+heatmap_data <- co_occurrence %>%
+  bind_rows(
+    co_occurrence %>% rename(dept_1 = dept_2, dept_2 = dept_1)
+  ) %>%
+  bind_rows(
+    tibble(
+      dept_1 = unique(c(co_occurrence$dept_1, co_occurrence$dept_2)),
+      dept_2 = unique(c(co_occurrence$dept_1, co_occurrence$dept_2)),
+      n = 0
+    )
+  ) %>%
+  distinct(dept_1, dept_2, .keep_all = TRUE)
+
+ggplot(heatmap_data, aes(x = dept_1, y = dept_2, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "C", name = "Co-occurrence") +
+  labs(
+    title = "Co-occurrence Heatmap of Departments",
+    subtitle = "Frequency of departments appearing together in baskets",
+    x = "Department",
+    y = "Department"
+  ) +
+  theme_minimal(base_size = 12, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+top_depts <- dept_basket_share %>%
+  slice_max(basket_share_pct, n = 10) %>%
+  pull(department_name)
+
+# HEATMAP DATA
+heatmap_data <- co_occurrence %>%
+  bind_rows(
+    co_occurrence %>%
+      transmute(dept_1 = dept_2, dept_2 = dept_1, n = n)
+  )
+
+top_depts <- dept_basket_share %>%
+  slice_max(basket_share_pct, n = 10) %>%
+  pull(department_name)
+
+heatmap_top <- heatmap_data %>%
+  filter(dept_1 %in% top_depts, dept_2 %in% top_depts)
+
+ggplot(heatmap_top, aes(x = dept_1, y = dept_2, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "C", name = "Co-occurrence") +
+  labs(
+    title = "Co-occurrence Heatmap (Top 10 Departments)",
+    subtitle = "Frequency of departments appearing together in baskets",
+    x = "Department",
+    y = "Department"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+```
+```{r}
+# CONDITIONAL CO-OCCURRENCE: P(partner | department)
+total_transactions <- n_distinct(long_data_clean$transaction_id)
+
+dept_freq <- long_data_clean %>%
+  distinct(transaction_id, department_name) %>%
+  count(department_name, name = "dept_count") %>%
+  mutate(
+    dept_share = dept_count / total_transactions
+  )
+
+co_occurrence_conditional <- bind_rows(
+  co_occurrence %>%
+    transmute(department = dept_1, partner = dept_2, pair_count = n),
+  co_occurrence %>%
+    transmute(department = dept_2, partner = dept_1, pair_count = n)
+) %>%
+  left_join(dept_freq, by = c("department" = "department_name")) %>%
+  mutate(
+    conditional_prob = pair_count / dept_count,
+    conditional_prob_pct = round(conditional_prob * 100, 1)
+  ) %>%
+  arrange(desc(conditional_prob))
+
+co_occurrence_conditional %>%
+  select(department, partner, pair_count, dept_count, conditional_prob_pct) %>%
+  head(10)
+```
+
+
+```{r}
+# TOP 5 PARTNERS PER DEPARTMENT
+co_by_dept <- co_occurrence_conditional %>%
+  group_by(department) %>%
+  slice_max(order_by = conditional_prob, n = 5, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(department, partner, pair_count, conditional_prob_pct) %>%
+  arrange(department, desc(conditional_prob_pct))
+
+co_by_dept
+```
+
+Counting: P(partner | department)
+So, if there is a department in the basket how often partner appears in a combo with the department. 
+
+
+
+```{r}
+# FILTERED TOP 10 RELATIONSHIPS
+excluded_depts <- c(
+  "Fruit & Vegetables",
+  "Books & Magazines",
+  "Care & Hygiene",
+  "Household & Pet"
+)
+
+top10_filtered <- co_occurrence_conditional %>%
+  filter(
+    !department %in% excluded_depts,
+    !partner %in% excluded_depts
+  ) %>%
+  arrange(desc(conditional_prob)) %>%
+  slice_head(n = 10) %>%
+  select(department, partner, pair_count, conditional_prob_pct)
+
+top10_filtered
+```
+After excluding dominant and non-core categories, the results highlight clearer and more meaningful relationships between departments. Strong associations emerge between staple and complementary products, such as Pasta & Rice with Sauces & Spices and Dairy & Eggs with Sauces & Spices, indicating structured purchasing behavior driven by meal preparation. These patterns are more informative than the unfiltered results and provide a more reliable baseline for identifying unusual or potentially anomalous transactions.
+
+```{r}
+top10_conditional <- co_occurrence_conditional %>%
+  slice_max(conditional_prob, n = 10)
+
+ggplot(top10_conditional,
+       aes(x = reorder(paste(department, partner, sep = " → "),
+                       conditional_prob),
+           y = conditional_prob_pct)) +
+  geom_col(
+    fill = "#6C9BCF",
+    color = "#2C3E50",
+    alpha = 0.85
+  ) +
+  coord_flip() +
+  labs(
+    title = "Top Conditional Relationships Between Departments",
+    subtitle = "P(partner | department)",
+    x = "Department pair",
+    y = "Conditional probability (%)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+  
+From the analysis, especially from the analysis based on probabilities and from the filtered analysis, some patterns emerge that appear to be random, such as Books & Magazines or Care & Hygiene with Fruit & Vegetables. These are likely due to the high number of transactions that include Fruit & Vegetables. At the same time, other combinations appear more meaningful and could be more relevant to investigate when searching for potentially fraudulent customers.
+1. Dairy & Eggs → Sauces & Spices (~80%)
+2. Cereals & Spreads → Sauces (~77%)
+3. Pasta & Rice → Sauces (~71%)
+4. Cheese & Tapas → Pasta (~74%)
+5. Meat & Fish → Pasta (~68%)
+
+
+
+
+
+
+
+#ANOMALIES
+
+## Introduction
+
+This R Markdown file focuses on the **price-based anomaly exploration** for Case 1. It uses the same base structure as `case 1.Rmd` so that the workflow remains consistent with the rest of the team. The goal is not to label baskets as fraudulent, but to identify transactions that **deviate strongly from typical price-related shopping behaviour** and may therefore deserve further inspection.
+
+More specifically, this analysis looks at four types of price-related anomalies:
+
+1. **Very low or very high total basket values**
+2. **Baskets whose total value is unusual given their size**
+3. **Small baskets containing unusually expensive items**
+4. **Baskets in which one item makes up an unusually large share of total spending**
+
+These patterns can later be combined with time-based anomalies and department-level patterns to support a broader fraud-detection strategy.
+
+## Summary Statistics for Price-Related Basket Features
+
+This table gives a compact overview of the main price-related variables that will be used in the anomaly exploration.
+
+```{r price_summary_table}
+basket_data <- basket_data %>%
+  mutate(
+    avg_price_per_item = avg_price,
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+
+price_stats <- basket_data %>%
+  select(total_items, total_price, avg_price_per_item, max_price, max_price_share, unique_departments) %>%
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "value") %>%
+  group_by(metric) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    p25 = quantile(value, 0.25, na.rm = TRUE),
+    p75 = quantile(value, 0.75, na.rm = TRUE),
+    p95 = quantile(value, 0.95, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    metric = recode(metric,
+      total_items = "Number of items",
+      total_price = "Total basket price (€)",
+      avg_price_per_item = "Average item price (€)",
+      max_price = "Maximum item price (€)",
+      max_price_share = "Share of basket value from most expensive item",
+      unique_departments = "Unique departments"
+    ),
+    across(where(is.numeric), ~ round(.x, 2))
+  )
+
+kable(price_stats,
+      caption = "Summary statistics for key price-based basket variables",
+      booktabs = TRUE,
+      align = "lrrrrrr") %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## Price-Based Anomaly Exploration
+
+### Very Low / Very High Total Basket Value
+
+The first step is to identify baskets with unusually low or unusually high total value. This is the most direct way to find transactions that differ from the majority of customers.
+
+Two thresholding approaches are used:
+
+- **Quantile-based thresholds**: bottom 1% and top 1%
+- **IQR-based thresholds**: the classical boxplot rule
+
+Using both makes the result more robust, because the total-price distribution is strongly right-skewed.
+
+```{r total_price_distribution}
+# Visualise total basket value in two ways:
+# 1) boxplot for outliers
+# 2) histogram on a log scale because the distribution is right-skewed
+
+ggplot(basket_data, aes(y = total_price)) +
+  geom_boxplot(fill = "skyblue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Total Basket Price",
+    subtitle = "Potential outliers are highlighted by the boxplot rule",
+    y = "Total basket price (€)"
+  )
+
+ggplot(basket_data, aes(x = total_price)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white") +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  theme_minimal() +
+  labs(
+    title = "Histogram of Total Basket Price (log scale)",
+    subtitle = "The log scale makes the long right tail easier to inspect",
+    x = "Total basket price (€, log scale)",
+    y = "Number of baskets"
+  )
+```
+
+```{r total_price_thresholds}
+# Compute two sets of anomaly thresholds for total basket value.
+price_q01 <- quantile(basket_data$total_price, 0.01, na.rm = TRUE)
+price_q99 <- quantile(basket_data$total_price, 0.99, na.rm = TRUE)
+
+price_q1  <- quantile(basket_data$total_price, 0.25, na.rm = TRUE)
+price_q3  <- quantile(basket_data$total_price, 0.75, na.rm = TRUE)
+price_iqr <- IQR(basket_data$total_price, na.rm = TRUE)
+
+price_lower_iqr <- price_q1 - 1.5 * price_iqr
+price_upper_iqr <- price_q3 + 1.5 * price_iqr
+
+price_thresholds <- tibble(
+  threshold = c("1st percentile", "99th percentile", "Lower IQR bound", "Upper IQR bound"),
+  value = c(price_q01, price_q99, price_lower_iqr, price_upper_iqr)
+)
+
+kable(price_thresholds %>% mutate(value = round(value, 2)),
+      caption = "Thresholds used to flag unusually cheap or expensive baskets",
+      booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r total_price_flags}
+# Flag baskets that are extreme in terms of total price.
+extreme_total_price_baskets <- basket_data %>%
+  mutate(
+    total_price_flag = case_when(
+      total_price <= price_q01 ~ "Very low total price (bottom 1%)",
+      total_price >= price_q99 ~ "Very high total price (top 1%)",
+      total_price < price_lower_iqr ~ "Low total price (IQR rule)",
+      total_price > price_upper_iqr ~ "High total price (IQR rule)",
+      TRUE ~ "Typical"
+    )
+  ) %>%
+  filter(total_price_flag != "Typical") %>%
+  arrange(desc(total_price))
+
+extreme_total_price_baskets %>%
+  count(total_price_flag)
+```
+
+```{r total_price_examples}
+# Show a few concrete examples of the most extreme baskets.
+head(extreme_total_price_baskets %>%
+       select(transaction_id, total_items, total_price, max_price, unique_departments, total_price_flag), 15) %>%
+  kable(caption = "Example baskets flagged for unusually low or high total value",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+### Interpretation
+
+Baskets at the very bottom or very top of the total-price distribution are interesting because they may reflect unusual behaviour, data issues, or genuine high-risk cases. However, total value alone is not enough: a very high total price can simply come from a large weekly shopping basket. Therefore, the next step is to evaluate basket value **relative to basket size**.
+
+### Basket Value Relative to Basket Size
+
+A basket with 40 items is expected to cost more than a basket with 3 items. To account for this, the analysis now examines whether total basket value is unusual **conditional on the number of items**.
+
+This is useful because some baskets may not look extreme in absolute euros, but still stand out relative to how many items they contain.
+
+```{r price_vs_items_plot}
+# Plot the relationship between basket size and basket value.
+# A smooth trend line helps reveal the normal price pattern.
+ggplot(basket_data, aes(x = total_items, y = total_price)) +
+  geom_point(alpha = 0.15, color = "darkorange") +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "Total Basket Price versus Basket Size",
+    subtitle = "Baskets far above or below the general trend may be price anomalies",
+    x = "Number of items",
+    y = "Total basket price (€)"
+  )
+```
+
+```{r price_size_residuals}
+# Fit a simple linear benchmark model.
+# The point is not perfect prediction but to identify baskets whose value
+# is much larger or smaller than expected given the number of items.
+price_size_model <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_total_price = predict(price_size_model, newdata = basket_data),
+    price_residual = total_price - expected_total_price,
+    price_residual_z = as.numeric(scale(price_residual))
+  )
+
+summary(price_size_model)
+```
+
+```{r residual_plot}
+# Visualise the residual anomalies directly.
+# Positive residuals mean the basket is more expensive than expected.
+# Negative residuals mean the basket is cheaper than expected.
+ggplot(basket_data, aes(x = total_items, y = price_residual)) +
+  geom_point(alpha = 0.15, color = "firebrick") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = c(-2, 2) * sd(basket_data$price_residual, na.rm = TRUE),
+             linetype = "dotted", color = "grey40") +
+  theme_minimal() +
+  labs(
+    title = "Residual Basket Value after Controlling for Basket Size",
+    subtitle = "Large positive or negative residuals indicate baskets that are unusual for their size",
+    x = "Number of items",
+    y = "Residual total price (€)"
+  )
+```
+
+```{r residual_tables}
+# Flag baskets whose value is especially unusual given their size.
+residual_anomalies <- basket_data %>%
+  mutate(
+    residual_flag = case_when(
+      price_residual_z >= 3 ~ "Much more expensive than expected",
+      price_residual_z <= -3 ~ "Much cheaper than expected",
+      TRUE ~ "Typical"
+    )
+  ) %>%
+  filter(residual_flag != "Typical") %>%
+  arrange(desc(abs(price_residual_z)))
+
+head(residual_anomalies %>%
+       select(transaction_id, total_items, total_price, expected_total_price,
+              price_residual, price_residual_z, max_price, residual_flag), 15) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Baskets with unusually high or low value relative to basket size",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+#### Interpretation
+
+This step is often more informative than looking only at raw basket value. For example, a small basket with a relatively high price may reflect high-value goods, while a large basket with a surprisingly low total value may indicate many low-price items, promotions, or potentially incomplete scans.
+
+### Expensive Items in Small Baskets
+
+This was already one of your original ideas, and it is kept here in a more systematic form. The main intuition is that small baskets with a very expensive item may deserve attention because a single high-value product can dominate the transaction and may create stronger incentives for fraud.
+
+```{r expensive_item_small_baskets_plot}
+# Plot basket size against the most expensive item in the basket.
+# The baskets of interest are located in the upper-left area:
+# few items, but one unusually expensive product.
+ggplot(basket_data, aes(x = total_items, y = max_price)) +
+  geom_point(alpha = 0.35, color = "darkred") +
+  theme_minimal() +
+  labs(
+    title = "Maximum Item Price versus Basket Size",
+    subtitle = "Small baskets with very expensive items are especially interesting",
+    x = "Number of items",
+    y = "Most expensive item in basket (€)"
+  )
+```
+
+```{r expensive_item_small_baskets_flags}
+# Define a threshold for unusually expensive items using the top 5% of max item prices.
+high_price_threshold <- quantile(basket_data$max_price, 0.95, na.rm = TRUE)
+
+# Flag small baskets that contain one of these expensive items.
+expensive_small_baskets <- basket_data %>%
+  mutate(
+    expensive_small_flag = total_items <= 3 & max_price >= high_price_threshold
+  ) %>%
+  filter(expensive_small_flag) %>%
+  arrange(desc(max_price), total_items)
+
+head(expensive_small_baskets %>%
+       select(transaction_id, total_items, total_price, max_price, max_price_share,
+              avg_price_per_item, unique_departments), 15) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Small baskets containing an unusually expensive item",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+#### Interpretation
+
+These baskets are not necessarily fraudulent, but they are distinct from regular baskets made up of many medium-priced grocery items. They may be particularly relevant for targeted checks because the transaction depends heavily on one or two expensive products.
+
+### Price Concentration: One Item Dominates the Basket
+
+A basket may also be suspicious when one item accounts for a very large share of the total basket value. This is slightly different from the previous analysis: even a basket with several items can still be highly concentrated if almost all spending comes from one product.
+
+```{r price_concentration_plot}
+# Plot how much of the basket value comes from the single most expensive item.
+ggplot(basket_data, aes(x = max_price_share)) +
+  geom_histogram(bins = 50, fill = "darkgreen", color = "white") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Max-Item Share in Basket Value",
+    subtitle = "Higher values indicate baskets dominated by one expensive item",
+    x = "Share of total basket value from the most expensive item",
+    y = "Number of baskets"
+  )
+```
+
+```{r price_concentration_flags}
+# Use the 95th percentile to flag unusually concentrated baskets.
+concentration_threshold <- quantile(basket_data$max_price_share, 0.95, na.rm = TRUE)
+
+concentrated_baskets <- basket_data %>%
+  filter(max_price_share >= concentration_threshold) %>%
+  arrange(desc(max_price_share), desc(max_price))
+
+head(concentrated_baskets %>%
+       select(transaction_id, total_items, total_price, max_price, max_price_share,
+              avg_price_per_item, unique_departments), 15) %>%
+  mutate(
+    max_price_share = percent(max_price_share, accuracy = 0.1),
+    across(c(total_price, max_price, avg_price_per_item), ~ round(.x, 2))
+  ) %>%
+  kable(caption = "Baskets where one item dominates total basket value",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+#### Interpretation
+
+Highly concentrated baskets can matter operationally because a missed scan of one expensive item would strongly affect the total transaction value. That does not prove fraud, but it makes such baskets relevant for risk prioritization.
+
+## Combining Price Signals into a Candidate Risk Score
+
+A single anomaly flag can be informative, but baskets that trigger **multiple** price-based anomaly signals are more interesting than baskets that trigger only one. To make this concrete, a simple rule-based score is created.
+
+This is not meant to be a final fraud model. It is only a transparent way to rank baskets for exploratory purposes.
+
+```{r combined_price_score}
+# Combine the main price anomaly signals into one transparent score.
+# Each triggered flag contributes one point.
+price_anomaly_candidates <- basket_data %>%
+  mutate(
+    flag_extreme_total_price = total_price <= price_q01 | total_price >= price_q99,
+    flag_price_size_residual = abs(price_residual_z) >= 3,
+    flag_expensive_small = total_items <= 3 & max_price >= high_price_threshold,
+    flag_concentrated = max_price_share >= concentration_threshold,
+    price_anomaly_score =
+      as.integer(flag_extreme_total_price) +
+      as.integer(flag_price_size_residual) +
+      as.integer(flag_expensive_small) +
+      as.integer(flag_concentrated)
+  ) %>%
+  arrange(desc(price_anomaly_score), desc(total_price), desc(max_price))
+
+price_anomaly_candidates %>%
+  count(price_anomaly_score) %>%
+  kable(caption = "Distribution of combined price-based anomaly scores",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r top_candidates_table}
+# Inspect the top-ranked baskets according to the rule-based price anomaly score.
+head(price_anomaly_candidates %>%
+       filter(price_anomaly_score >= 2) %>%
+       select(transaction_id, total_items, total_price, expected_total_price,
+              price_residual_z, max_price, max_price_share,
+              unique_departments, price_anomaly_score), 20) %>%
+  mutate(
+    across(c(total_price, expected_total_price, price_residual_z, max_price), ~ round(.x, 2)),
+    max_price_share = percent(max_price_share, accuracy = 0.1)
+  ) %>%
+  kable(caption = "Top candidate baskets based on multiple price anomaly signals",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## Drill-Down: Item Composition of Top Candidate Baskets
+
+Once the strongest candidate baskets have been identified, it is useful to inspect which concrete items or departments make them unusual. The code below extracts the item-level records for the top price-anomaly baskets.
+
+```{r drill_down_candidates}
+# Select a few of the strongest candidate baskets for manual inspection.
+top_candidate_ids <- price_anomaly_candidates %>%
+  filter(price_anomaly_score >= 2) %>%
+  slice_head(n = 10) %>%
+  pull(transaction_id)
+
+candidate_item_view <- long_data_clean %>%
+  filter(transaction_id %in% top_candidate_ids) %>%
+  arrange(transaction_id, desc(price)) %>%
+  select(transaction_id, department_name, time, price)
+
+head(candidate_item_view, 30) %>%
+  kable(caption = "Item-level drill-down for selected top candidate baskets",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## Conclusion
+
+The price-based anomaly exploration shows that most baskets follow a fairly regular pattern, but a smaller subset stands out clearly.
+
+The main findings are:
+
+- Some baskets are **extremely cheap or extremely expensive** compared with the overall distribution.
+- Some baskets have a **total value that is unusual for their number of items**, which is often more informative than absolute price alone.
+- A number of **small baskets contain unusually expensive items**, making them operationally relevant for spot checks.
+- In some baskets, **one item dominates the total basket value**, meaning that a single missed scan would have a large monetary effect.
+- Baskets that trigger **multiple price anomaly signals at once** are strong candidates for further investigation.
+
+Overall, these results do not prove fraud directly. However, they help define which baskets differ most from normal customer behaviour and therefore provide a useful input for later fraud-risk scoring, manual inspections, or combined models that also include timing and department-based features.
+
+
+# Time-Based Anomalies
+
+## Extremely Fast / Extremely Slow Scanning
+
+```{r hannes_time_distribution}
+# Filter top 1% for readability
+basket_speed_filtered <- basket_data %>%
+  filter(avg_time_per_item < quantile(avg_time_per_item, 0.99, na.rm = TRUE))
+
+median_speed <- median(basket_speed_filtered$avg_time_per_item, na.rm = TRUE)
+
+ggplot(basket_speed_filtered, aes(x = avg_time_per_item)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 50,
+    fill = "#B7E4C7",
+    color = "white",
+    alpha = 0.8
+  ) +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(
+    xintercept = median_speed,
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Distribution of average scan time per item",
+    subtitle = "Top 1% removed; dashed line indicates median",
+    x = "Average time per item (seconds)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+
+basket_speed_filtered %>%
+  mutate(speed_group = case_when(
+    avg_time_per_item < quantile(avg_time_per_item, 0.25) ~ "Fast",
+    avg_time_per_item > quantile(avg_time_per_item, 0.75) ~ "Slow",
+    TRUE ~ "Normal"
+  )) %>%
+  ggplot(aes(x = speed_group, y = avg_time_per_item, fill = speed_group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  labs(
+    title = "Scan time behavior groups",
+    x = "Group",
+    y = "Average time per item (seconds)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+
+
+basket_data %>%
+  mutate(anomaly = case_when(
+    avg_time_per_item >= quantile(avg_time_per_item, 0.99, na.rm = TRUE) ~ "Very slow",
+    avg_time_per_item <= quantile(avg_time_per_item, 0.01, na.rm = TRUE) ~ "Very fast",
+    TRUE ~ "Normal"
+  )) %>%
+  mutate(anomaly = factor(anomaly, levels = c("Very fast", "Normal", "Very slow"))) %>%
+  ggplot(aes(x = anomaly, y = avg_time_per_item, fill = anomaly)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  scale_y_log10() +
+  scale_fill_manual(values = c(
+    "Very fast" = "#F1948A",
+    "Normal" = "#A9DFBF",
+    "Very slow" = "#85C1E9"
+  )) +
+  labs(
+    title = "Extreme scan time behavior (log scale)",
+    subtitle = "Log scale improves comparability between groups",
+    x = "",
+    y = "Average time per item (seconds, log scale)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+time_bounds <- quantile(
+  basket_data$avg_time_per_item,
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+extreme_time_baskets <- basket_data %>%
+  mutate(
+    time_anomaly_type = case_when(
+      avg_time_per_item <= time_bounds[1] ~ "Very fast scan",
+      avg_time_per_item >= time_bounds[2] ~ "Very slow scan",
+      TRUE ~ "Normal"
+    )
+  ) %>%
+  filter(time_anomaly_type != "Normal") %>%
+  arrange(desc(avg_time_per_item))
+
+head(extreme_time_baskets)
+```
+
+## Total Time vs Total Items Checkout
+
+```{r hannes_total_time_items}
+ggplot(basket_data, aes(x = total_items, y = total_time)) +
+  geom_hex(bins = 40) +
+  scale_fill_viridis_c(name = "Count") +
+  geom_smooth(method = "lm", color = "red", linetype = "dashed", se = FALSE) +
+  labs(
+    title = "Total scan time vs basket size",
+    subtitle = "Hexagonal density plot with linear trend",
+    x = "Number of items",
+    y = "Total scan time (seconds)"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Additional Department EDA
+
+
+```{r}
+department_time <- long_data_clean %>%
+  filter(!is.na(department_name)) %>%
+  group_by(transaction_id, department_name) %>%
+  summarise(
+    avg_time_department = mean(time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+y_limit <- quantile(department_time$avg_time_department, 0.99, na.rm = TRUE)
+
+ggplot(department_time, aes(
+  x = reorder(department_name, avg_time_department, median, na.rm = TRUE),
+  y = avg_time_department
+)) +
+  geom_boxplot(
+    fill = "#F6C6D0",
+    color = "#2C3E50",
+    outlier.shape = NA,
+    alpha = 0.8
+  ) +
+  coord_flip(ylim = c(0, y_limit)) +
+  labs(
+    title = "Average time between scans by department",
+    subtitle = "Department-level averages per transaction; top 1% hidden for readability",
+    x = NULL,
+    y = "Average time between scans (seconds)"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 9),
+    panel.grid.minor = element_blank()
+  )
+```
+The boxplot shows that average scanning time differs substantially across departments. Fruit & Vegetables has the lowest median time and a compact distribution, suggesting a more routine and consistent scanning pattern. In contrast, Beer & Wine, Freezer, Soda & Juices, and Care & Hygiene show higher median times and wider variability, indicating longer pauses or less consistent scanning behavior.
+
+This suggests that product category is related to scanning behavior, meaning that department-level context can be useful when identifying unusual transactions.
+
+
+```{r}
+price_limit <- quantile(long_data_clean$price, 0.99, na.rm = TRUE)
+
+ggplot(long_data_clean, aes(
+  x = reorder(department_name, price, median, na.rm = TRUE),
+  y = price
+)) +
+  geom_boxplot(
+    fill = "#D8BFD8",
+    color = "#2C3E50",
+    outlier.shape = NA,
+    alpha = 0.8
+  ) +
+  coord_flip(ylim = c(0, price_limit)) +
+  labs(
+    title = "Item price distribution by department",
+    subtitle = "Top 1% hidden for readability",
+    x = "Department",
+    y = "Item price (€)"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 9),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The boxplot shows that item prices differ clearly across departments. Meat & Fish, Salads & Meals, Beer & Wine, and Books & Magazines have higher median item prices, while Pasta & Rice, Cereals & Spreads, and Soda & Juices are generally cheaper.
+
+The wider spreads in departments such as Salads & Meals, Beer & Wine, Freezer, and Household & Pet indicate that these categories contain both lower-priced and higher-priced products. This suggests that department-level price context is important when identifying price-based anomalies, because a high item price may be normal in one department but unusual in another.
+
+**Price anomalies should be evaluated relative to department, not only globally**.
+
+```{r}
+basket_data %>%
+  mutate(unique_departments = factor(unique_departments, levels = sort(unique(unique_departments))))  %>%
+  ggplot(aes(
+    x = unique_departments,
+    y = max_price_share
+  )) +
+  geom_boxplot(
+    fill = "#F5B7B1",
+    color = "#2C3E50",
+    outlier.alpha = 0.15,
+    outlier.size = 0.8,
+    alpha = 0.8
+  ) +
+  coord_flip() +
+  labs(
+    title = "Price concentration by basket complexity",
+    subtitle = "Share of basket value explained by the most expensive item",
+    x = "Number of departments in basket",
+    y = "Share of basket value from most expensive item"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The plot shows a clear inverse relationship between basket complexity and price concentration. Baskets with only one or two departments often have a large share of total value driven by a single expensive item, sometimes exceeding 50% of the basket value.
+
+As the number of departments increases, price concentration decreases and becomes more stable. In more complex baskets, the total value is distributed across multiple items, reducing the dominance of any single product.
+
+This suggests that price-based anomalies should be interpreted in context: a high-value item dominating a simple basket may be expected behavior, while a similar pattern in a complex basket may be more unusual.
+
+
+```{r}
+basket_data %>%
+  count(unique_departments) %>%
+  ggplot(aes(x = factor(unique_departments), y = n)) +
+  geom_col(
+    fill = "#D7BDE2",
+    color = "#2C3E50",
+    alpha = 0.85
+  ) +
+  labs(
+    title = "Distribution of department diversity per basket",
+    subtitle = "Number of unique departments included in each transaction",
+    x = "Unique departments",
+    y = "Number of baskets"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The distribution shows that most baskets contain products from several departments, with the highest concentration around 8 to 11 unique departments. Very simple baskets with only a few departments and highly diverse baskets with many departments are less common.
+
+This suggests that department diversity can be used as an additional basket-complexity feature. Very low or very high diversity may indicate atypical shopping behavior and can support anomaly detection.
+
+
+```{r}
+# CONSISTENT TIME THRESHOLDS
+
+fast_threshold <- quantile(long_data_clean$time, 0.05, na.rm = TRUE)
+slow_threshold <- quantile(long_data_clean$time, 0.95, na.rm = TRUE)
+
+cat("Fast threshold (5th percentile):", fast_threshold, "\n")
+cat("Slow threshold (95th percentile):", slow_threshold, "\n")
+
+
+# 1. SLOW-SCAN ANOMALIES BY DEPARTMENT
+
+department_slow_anomalies <- long_data_clean %>%
+  mutate(slow_scan = time >= slow_threshold) %>%
+  group_by(department_name) %>%
+  summarise(
+    total_items = n(),
+    slow_items = sum(slow_scan, na.rm = TRUE),
+    slow_share = slow_items / total_items * 100,
+    .groups = "drop"
+  )
+
+ggplot(department_slow_anomalies, aes(
+  x = reorder(department_name, slow_share),
+  y = slow_share
+)) +
+  geom_col(fill = "#A7C7E7", color = "#2C3E50", alpha = 0.85) +
+  geom_text(aes(label = round(slow_share, 1)), hjust = -0.1, size = 3.2) +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, max(department_slow_anomalies$slow_share, na.rm = TRUE) * 1.15)
+  ) +
+  labs(
+    title = "Share of slow-scan anomalies by department",
+    subtitle = "Slow scans defined as item scan times above the 95th percentile",
+    x = NULL,
+    y = "Slow-scan anomalies (%)"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+# 2. FAST AND SLOW ANOMALIES BY DEPARTMENT
+
+department_fast_slow <- long_data_clean %>%
+  mutate(
+    anomaly = case_when(
+      time <= fast_threshold ~ "Fast",
+      time >= slow_threshold ~ "Slow",
+      TRUE ~ "Normal"
+    )
+  ) %>%
+  group_by(department_name) %>%
+  summarise(
+    total_items = n(),
+    fast_share = sum(anomaly == "Fast", na.rm = TRUE) / total_items * 100,
+    slow_share = sum(anomaly == "Slow", na.rm = TRUE) / total_items * 100,
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(fast_share, slow_share),
+    names_to = "anomaly",
+    values_to = "share"
+  ) %>%
+  mutate(
+    anomaly = recode(
+      anomaly,
+      fast_share = "Fast",
+      slow_share = "Slow"
+    )
+  )
+
+ggplot(department_fast_slow,
+       aes(x = reorder(department_name, share), y = share, fill = anomaly)) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "grey40") +
+  geom_col(position = "dodge", color = "#2C3E50", alpha = 0.85) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Fast" = "#F1948A",
+    "Slow" = "#85C1E9"
+  )) +
+  labs(
+    title = "Fast and slow scan anomalies by department",
+    subtitle = "Fast and slow scans are defined using the 5th and 95th percentiles",
+    x = NULL,
+    y = "Share of department items (%)",
+    fill = "Anomaly type"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+# 3. FAST/SLOW TIME BASKETS AT BASKET LEVEL
+
+basket_fast_threshold <- quantile(basket_data$avg_time_per_item, 0.05, na.rm = TRUE)
+basket_slow_threshold <- quantile(basket_data$avg_time_per_item, 0.95, na.rm = TRUE)
+
+extreme_time_baskets <- basket_data %>%
+  mutate(
+    time_anomaly_type = case_when(
+      avg_time_per_item <= basket_fast_threshold ~ "Fast scan",
+      avg_time_per_item >= basket_slow_threshold ~ "Slow scan",
+      TRUE ~ "Normal"
+    )
+  ) %>%
+  filter(time_anomaly_type != "Normal") %>%
+  arrange(desc(avg_time_per_item))
+
+head(extreme_time_baskets)
+
+
+# 4. FAST/SLOW SCAN TIME BEHAVIOR BOXPLOT
+
+basket_data %>%
+  mutate(
+    anomaly = case_when(
+      avg_time_per_item <= basket_fast_threshold ~ "Fast scan",
+      avg_time_per_item >= basket_slow_threshold ~ "Slow scan",
+      TRUE ~ "Normal"
+    ),
+    anomaly = factor(anomaly, levels = c("Fast scan", "Normal", "Slow scan"))
+  ) %>%
+  ggplot(aes(x = anomaly, y = avg_time_per_item, fill = anomaly)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  scale_y_log10() +
+  scale_fill_manual(values = c(
+    "Fast scan" = "#F1948A",
+    "Normal" = "#A9DFBF",
+    "Slow scan" = "#85C1E9"
+  )) +
+  labs(
+    title = "Extreme scan time behavior (log scale)",
+    subtitle = "Fast and slow scans are defined using the 5th and 95th percentiles",
+    x = NULL,
+    y = "Average time per item (seconds, log scale)"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+# 5. SUSPICIOUS PATTERN: FAST SCAN + HIGH PRICE CONCENTRATION
+
+basket_data <- basket_data %>%
+  mutate(
+    suspicious_pattern = case_when(
+      max_price_share > 0.5 &
+        avg_time_per_item <= basket_fast_threshold ~ "High-risk",
+      TRUE ~ "Normal"
+    )
+  )
+
+high_risk_baskets <- basket_data %>%
+  filter(
+    suspicious_pattern == "High-risk",
+    unique_departments <= 3
+  )
+
+head(high_risk_baskets)
+
+
+# 6. SUSPICIOUS BEHAVIOR PLOT
+
+ggplot(basket_data, aes(x = max_price_share, y = avg_time_per_item)) +
+  annotate(
+    "rect",
+    xmin = 0.5,
+    xmax = 1,
+    ymin = 0,
+    ymax = basket_fast_threshold,
+    fill = "#FADBD8",
+    alpha = 0.6
+  ) +
+  geom_point(
+    data = basket_data %>% filter(suspicious_pattern == "Normal"),
+    color = "grey70",
+    alpha = 0.2,
+    size = 1
+  ) +
+  geom_point(
+    data = basket_data %>% filter(suspicious_pattern == "High-risk"),
+    color = "#E74C3C",
+    size = 2.5,
+    alpha = 0.9
+  ) +
+  geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    color = "#C0392B",
+    linewidth = 0.8
+  ) +
+  geom_hline(
+    yintercept = basket_fast_threshold,
+    linetype = "dashed",
+    color = "#C0392B",
+    linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = 0.75,
+    y = basket_fast_threshold * 0.7,
+    label = "High-risk zone",
+    color = "#C0392B",
+    size = 4,
+    family = "serif",
+    fontface = "bold"
+  ) +
+  coord_cartesian(ylim = c(0, 200)) +
+  labs(
+    title = "Suspicious basket behavior",
+    subtitle = "Fast scans combined with high price concentration",
+    x = "Share of basket value from most expensive item",
+    y = "Average time per item (seconds)"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# 7. COUNT HIGH-RISK PATTERNS
+
+basket_data %>%
+  count(suspicious_pattern) %>%
+  mutate(
+    share = round(n / sum(n) * 100, 2)
+  )
+```
+
+### 1.
+
+The expected share of slow scans is approximately 5%, as anomalies are defined based on the 95th percentile. However, several departments significantly exceed this baseline, particularly Beer & Wine, Household & Pet, Freezer, and Care & Hygiene.
+
+This indicates that slow scanning behavior is not randomly distributed but concentrated in specific product categories. These departments may involve more complex or irregular shopping behavior and should be considered when identifying potentially suspicious transactions.
+
+### 2.
+
+The expected share of both fast and slow scans is around 5%, since they are defined using the 5th and 95th percentiles. However, the graph shows that some departments clearly exceed this level, meaning these behaviors are not evenly distributed across categories.
+
+Cheese & Tapas and Care & Hygiene show a disproportionately high share of fast scans, while Beer & Wine, Household & Pet, and Freezer exhibit elevated slow-scan behavior. In contrast, departments such as Fruit & Vegetables and Dairy & Eggs remain close to the expected baseline.
+
+This indicates that scanning anomalies are not randomly distributed but concentrated in specific product categories. These differences suggest that department-level context is important when identifying potentially suspicious transactions.
+
+### 3.
+
+The plot shows a clear relationship between basket size and scanning behavior. Small baskets have the highest average time per item and the largest variability, suggesting more irregular or exploratory shopping behavior. 
+
+As basket size increases, the average time per item decreases and becomes more stable, indicating more structured and efficient scanning patterns.
+
+This implies that slow scanning is not necessarily suspicious in small baskets, but may be more unusual in larger baskets where behavior is typically more consistent.
+
+### 4.
+
+The highlighted region represents a high-risk behavioral pattern, where baskets are scanned extremely quickly while a single item dominates the total value.
+
+Although such cases are relatively rare, they clearly deviate from normal customer behavior and may indicate incomplete scanning or intentional manipulation.
+
+This demonstrates that combining time-based and price-based features allows for effective identification of suspicious transactions.
+
+
+
+
+
+
+
+# FRAUD DETECTION - RISK 
+
+
+```{r}
+# 1. Basket-level dataset
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# 2. Fast / slow scan thresholds
+p5_time  <- quantile(basket_data$avg_time_per_item, 0.05, na.rm = TRUE)
+p95_time <- quantile(basket_data$avg_time_per_item, 0.95, na.rm = TRUE)
+
+# 3. Basket size group
+basket_data <- basket_data %>%
+  mutate(
+    fast_flag = avg_time_per_item < p5_time,
+    slow_flag = avg_time_per_item > p95_time,
+    
+    basket_size_group = case_when(
+      total_items <= 10 ~ "small",
+      total_items <= 25 ~ "medium",
+      TRUE ~ "large"
+    )
+  )
+
+# 4. Expected time given basket size
+model_time <- lm(avg_time_per_item ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = basket_data),
+    time_deviation = avg_time_per_item - expected_time_given_size
+  )
+
+# 5. Expected price given basket size
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items,
+    price_residual = residuals(model_price),
+    price_concentration = max_price / total_price
+  )
+```
+
+
+```{r}
+# 6. Department co-occurrence score
+
+dept_data <- long_data_clean %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+pairs <- dept_data %>%
+  inner_join(dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y) %>%
+  rename(
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+co_occurrence <- pairs %>%
+  count(dept_1, dept_2, sort = TRUE) %>%
+  mutate(score = n / max(n))
+
+pairs_scored <- pairs %>%
+  left_join(co_occurrence, by = c("dept_1", "dept_2"))
+
+co_score <- pairs_scored %>%
+  group_by(transaction_id) %>%
+  summarise(
+    co_occurrence_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(co_score, by = "transaction_id") %>%
+  mutate(
+    co_occurrence_score = replace_na(co_occurrence_score, 0)
+  )
+```
+
+
+```{r}
+# 7. Thresholds for risk rules
+
+p5_price  <- quantile(basket_data$total_price, 0.05, na.rm = TRUE)
+p95_price <- quantile(basket_data$total_price, 0.95, na.rm = TRUE)
+
+p5_resid  <- quantile(basket_data$price_residual, 0.05, na.rm = TRUE)
+p95_resid <- quantile(basket_data$price_residual, 0.95, na.rm = TRUE)
+
+p95_conc <- quantile(basket_data$price_concentration, 0.95, na.rm = TRUE)
+
+p5_co <- quantile(basket_data$co_occurrence_score, 0.05, na.rm = TRUE)
+
+# 8. Rule-based risk score
+
+basket_risk <- basket_data %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+    
+    low_total_price = total_price < p5_price,
+    high_total_price = total_price > p95_price,
+    
+    unusually_cheap_for_size = price_residual < p5_resid,
+    unusually_expensive_for_size = price_residual > p95_resid,
+    
+    high_price_concentration = price_concentration > p95_conc,
+    
+    unusual_department_combination = co_occurrence_score < p5_co,
+    
+    risk_score =
+      as.integer(fast_scan) +
+      as.integer(slow_scan) +
+      as.integer(low_total_price) +
+      as.integer(high_total_price) +
+      as.integer(unusually_cheap_for_size) +
+      as.integer(unusually_expensive_for_size) +
+      as.integer(high_price_concentration) +
+      as.integer(unusual_department_combination)
+  ) %>%
+  arrange(desc(risk_score))
+```
+
+
+```{r}
+table(basket_risk$risk_score)
+
+top_risky <- basket_risk %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    time_deviation,
+    price_deviation,
+    price_concentration,
+    co_occurrence_score,
+    risk_score
+  ) %>%
+  arrange(desc(risk_score)) %>%
+  head(20)
+
+View(top_risky)
+
+basket_risk %>%
+  group_by(risk_score) %>%
+  summarise(
+    avg_time = mean(avg_time_per_item),
+    avg_price = mean(total_price),
+    avg_items = mean(total_items)
+  )
+
+
+ggplot() +
+  
+  # нормальные
+  geom_point(
+    data = basket_risk %>% filter(risk_score <= 1),
+    aes(avg_time_per_item, total_price),
+    color = "#B0BEC5",
+    alpha = 0.08,
+    size = 1
+  ) +
+  
+  # medium
+  geom_point(
+    data = basket_risk %>% filter(risk_score == 2),
+    aes(avg_time_per_item, total_price),
+    color = "#42A5F5",
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  
+  # high (3)
+  geom_point(
+    data = basket_risk %>% filter(risk_score == 3),
+    aes(avg_time_per_item, total_price),
+    color = "#8E24AA",
+    alpha = 0.4,
+    size = 2
+  ) +
+  
+  # VERY high (4)
+  geom_point(
+    data = basket_risk %>% filter(risk_score == 4),
+    aes(avg_time_per_item, total_price),
+    color = "#D32F2F",
+    size = 3
+  ) +
+  
+  scale_x_log10() +
+  scale_y_log10() +
+  
+  labs(
+    title = "Customer behavior and fraud risk",
+    subtitle = "High-risk transactions clearly deviate from normal patterns",
+    x = "Average time per item (seconds)",
+    y = "Total basket value (€)"
+  ) +
+  geom_vline(xintercept = 150, linetype = "dashed", color = "grey40") +
+geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
+  
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+
+
+# Fraud risk detection on unseen data: case1
+
+```{r}
+## Fraud detection on unseen data: case1
+
+lines <- readLines("~/Desktop/supermarket case/case1.csv", warn = FALSE)
+
+case1_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+case1_long <- case1_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+case1_basket <- case1_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# Co-occurrence score for case1 using scores learned from original data
+case1_dept_data <- case1_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+case1_pairs <- case1_dept_data %>%
+  inner_join(case1_dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y) %>%
+  rename(
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+case1_co_score <- case1_pairs %>%
+  left_join(co_occurrence %>% select(dept_1, dept_2, score),
+            by = c("dept_1", "dept_2")) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    co_occurrence_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+case1_basket <- case1_basket %>%
+  left_join(case1_co_score, by = "transaction_id") %>%
+  mutate(
+    co_occurrence_score = replace_na(co_occurrence_score, 0),
+    
+    expected_time_given_size = predict(model_time, newdata = .),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+    
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items,
+    
+    price_concentration = max_price / total_price
+  )
+
+case1_basket <- case1_basket %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+    
+    low_total_price = total_price < p5_price,
+    high_total_price = total_price > p95_price,
+    
+    unusually_cheap_for_size = price_deviation < p5_resid,
+    unusually_expensive_for_size = price_deviation > p95_resid,
+    
+    high_price_concentration = price_concentration > p95_conc,
+    unusual_department_combination = co_occurrence_score < p5_co,
+    
+    risk_score =
+      as.integer(fast_scan) +
+      as.integer(slow_scan) +
+      as.integer(low_total_price) +
+      as.integer(high_total_price) +
+      as.integer(unusually_cheap_for_size) +
+      as.integer(unusually_expensive_for_size) +
+      as.integer(high_price_concentration) +
+      as.integer(unusual_department_combination),
+    
+
+    final_score =
+  risk_score * 1.8 +
+  as.numeric(scale(total_price)) * 2.2 +
+  as.numeric(scale(abs(price_deviation))) * 1 +
+  as.numeric(scale(abs(time_deviation))) * 0.6 +
+  as.numeric(scale(price_concentration)) * 0.5
+)
+
+top_150 <- case1_basket %>%
+  arrange(desc(final_score)) %>%
+  slice_head(n = 150)
+
+writeLines(as.character(top_150$transaction_id))
+```
+
+```{r}
+summary(basket_data$avg_time_per_item)
+summary(case1_basket$avg_time_per_item)
+
+summary(basket_data$total_price)
+summary(case1_basket$total_price)
+
+summary(basket_data$total_items)
+summary(case1_basket$total_items)
+
+ggplot() +
+  geom_density(data = basket_data, aes(avg_time_per_item), color = "blue") +
+  geom_density(data = case0_basket, aes(avg_time_per_item), color = "red") +
+  labs(title = "Train vs Case1: Scan time")
+```
+# Isolation Forest 
+
+```{r}
+# 1. Features для модели
+X <- basket_risk %>%
+  select(
+    total_items,
+    total_price,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_residual,
+    price_concentration
+  ) %>%
+  scale()
+
+# 2. Isolation Forest
+iso_model <- isolation.forest(
+  X,
+  ntrees = 100,
+  sample_size = 256,
+  ndim = 1
+)
+
+# 3. Anomaly scores
+basket_risk$if_score <- predict(
+  iso_model,
+  X,
+  type = "score"
+)
+
+# 4. Flag top 2% as anomalies
+threshold <- quantile(basket_risk$if_score, 0.98, na.rm = TRUE)
+
+basket_risk <- basket_risk %>%
+  mutate(
+    if_anomaly = if_score >= threshold
+  )
+
+# 5. Check results
+table(basket_risk$if_anomaly)
+
+table(
+  rule_based = basket_risk$risk_score >= 3,
+  isolation_forest = basket_risk$if_anomaly
+)
+
+basket_risk %>%
+  arrange(desc(if_score)) %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    price_residual,
+    price_concentration,
+    risk_score,
+    if_score,
+    if_anomaly
+  ) %>%
+  head(20)
+```
+
+
+# LOF
+
+
+```{r}
+install.packages("dbscan")
+library(dbscan)
+
+X <- basket_risk %>%
+  select(
+    total_items,
+    total_price,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_residual,
+    price_concentration
+  ) %>%
+  scale()
+
+lof_scores <- lof(X, minPts = 20)
+threshold <- quantile(lof_scores, 0.98, na.rm = TRUE)
+
+basket_risk <- basket_risk %>%
+  mutate(
+    lof_score = lof_scores,
+    lof_anomaly = lof_score >= threshold
+  )
+table(basket_risk$lof_anomaly)
+
+table(
+  rule = basket_risk$risk_score >= 3,
+  lof = basket_risk$lof_anomaly
+)
+
+table(
+  iso = basket_risk$if_anomaly,
+  lof = basket_risk$lof_anomaly
+)
+```
+
+```{r}
+library(dbscan)
+
+# 1. Подготовка данных (важно масштабировать!)
+X <- basket_risk %>%
+  select(
+    total_items,
+    total_price,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_residual,
+    price_concentration
+  ) %>%
+  scale()
+
+# 2. LOF (аналог n_neighbors=20)
+lof_scores <- lof(X, minPts = 20)
+
+# 3. Превращаем в "labels" (аналог contamination=0.02)
+threshold <- quantile(lof_scores, 0.98, na.rm = TRUE)
+
+basket_risk <- basket_risk %>%
+  mutate(
+    lof_score = lof_scores,
+    lof_label = ifelse(lof_score >= threshold, -1, 1)  # как в sklearn
+  )
+
+table(basket_risk$lof_label)
+
+table(
+  rule = basket_risk$risk_score >= 3,
+  lof = basket_risk$lof_label == -1
+)
+```
+
+# K-MEANS
+
+
+
+```{r}
+# 1. Подготовка данных (обязательно scale!)
+X <- basket_risk %>%
+  select(
+    total_items,
+    total_price,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_residual,
+    price_concentration
+  ) %>%
+  scale()
+
+# 2. K-means
+set.seed(123)
+kmeans_model <- kmeans(X, centers = 5, nstart = 25)
+
+# 3. Расстояние до ближайшего кластера
+# centers = координаты центров
+centers <- kmeans_model$centers
+clusters <- kmeans_model$cluster
+
+# функция расстояния до центра своего кластера
+distance <- sqrt(rowSums((X - centers[clusters, ])^2))
+
+# 4. Добавляем в датасет
+basket_risk <- basket_risk %>%
+  mutate(
+    kmeans_cluster = clusters,
+    kmeans_distance = distance
+  )
+
+threshold <- quantile(basket_risk$kmeans_distance, 0.98, na.rm = TRUE)
+
+basket_risk <- basket_risk %>%
+  mutate(
+    kmeans_anomaly = kmeans_distance >= threshold
+  )
+
+table(basket_risk$kmeans_anomaly)
+
+table(
+  rule = basket_risk$risk_score >= 3,
+  kmeans = basket_risk$kmeans_anomaly
+)
+```
+
+
+# SEMI-SUPERVISED
+
+```{r}
+lines_cashier <- readLines("~/Desktop/supermarket case/cashier_data.csv", warn = FALSE)
+
+cashier_raw <- tibble(
+  transaction_id = 1:length(lines_cashier),
+  basket = lines_cashier
+)
+
+cashier_long <- cashier_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(price),
+    price >= 0
+  )
+
+cashier_long <- cashier_long %>%
+  mutate(department_name = dept_map[as.character(department)])
+
+cashier_basket <- cashier_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+nrow(cashier_long)
+head(cashier_long)
+head(cashier_basket)
+```
+```{r}
+# 1. Signature только по департаментам, без цены
+self_dept_signature <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dept_signature = paste(sort(department), collapse = "|"),
+    total_price_self = sum(price, na.rm = TRUE),
+    total_items_self = n(),
+    .groups = "drop"
+  ) %>%
+  rename(transaction_id_self = transaction_id)
+
+cashier_dept_signature <- cashier_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dept_signature = paste(sort(department), collapse = "|"),
+    total_price_cashier = sum(price, na.rm = TRUE),
+    total_items_cashier = n(),
+    .groups = "drop"
+  ) %>%
+  rename(transaction_id_cashier = transaction_id)
+
+dept_matches <- self_dept_signature %>%
+  inner_join(cashier_dept_signature, by = "dept_signature") %>%
+  mutate(
+    price_gap = total_price_cashier - total_price_self
+  )
+
+nrow(dept_matches)
+
+
+
+good_matches <- dept_matches %>%
+  filter(abs(price_gap) <= 5)
+
+nrow(good_matches)
+
+
+
+suspicious_matches <- dept_matches %>%
+  filter(price_gap > 10) %>%
+  arrange(desc(price_gap))
+
+head(suspicious_matches, 20)
+
+```
+
+
+```{r}
+self_items <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    items = list(unique(department)),
+    .groups = "drop"
+  )
+
+# Self-scan signature: department + price, time ignored
+self_signature <- long_data_clean %>%
+  mutate(
+    item_key = paste(department, round(price, 2), sep = "_")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    basket_signature = paste(sort(item_key), collapse = "|"),
+    total_price_self = sum(price, na.rm = TRUE),
+    total_items_self = n(),
+    .groups = "drop"
+  ) %>%
+  rename(transaction_id_self = transaction_id)
+
+cashier_signature <- cashier_long %>%
+  mutate(
+    item_key = paste(department, round(price, 2), sep = "_")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    basket_signature = paste(sort(item_key), collapse = "|"),
+    total_price_cashier = sum(price, na.rm = TRUE),
+    total_items_cashier = n(),
+    .groups = "drop"
+  ) %>%
+  rename(transaction_id_cashier = transaction_id)
+
+exact_matches <- self_signature %>%
+  inner_join(cashier_signature, by = "basket_signature")
+exact_matches %>%
+  select(
+    transaction_id_self,
+    transaction_id_cashier,
+    total_items_self,
+    total_price_self,
+    total_items_cashier,
+    total_price_cashier
+  ) %>%
+  head(20)
+
+nrow(exact_matches)
+```
+
+
+```{r}
+cashier_dept_baseline <- cashier_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dept_set = paste(sort(unique(department)), collapse = "|"),
+    total_price = sum(price, na.rm = TRUE),
+    total_items = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(dept_set) %>%
+  summarise(
+    cashier_avg_price = mean(total_price),
+    cashier_median_price = median(total_price),
+    cashier_avg_items = mean(total_items),
+    n_cashier = n(),
+    .groups = "drop"
+  )
+
+self_vs_cashier <- self_dept_set %>%
+  rename(total_price = total_price_self, total_items = total_items_self) %>%
+  left_join(cashier_dept_baseline, by = "dept_set") %>%
+  mutate(
+    cashier_price_gap = cashier_median_price - total_price
+  )
+
+self_vs_cashier %>%
+  filter(!is.na(cashier_price_gap)) %>%
+  arrange(desc(cashier_price_gap)) %>%
+  head(20)
+```
+
+
+
+
+
+
