@@ -2294,7 +2294,7 @@ case0_pairs <- case0_dept_data %>%
     dept_2 = department_name.y
   )
 
-case0_co_score <- case10_pairs %>%
+case0_co_score <- case0_pairs %>%
   left_join(co_occurrence %>% select(dept_1, dept_2, score),
             by = c("dept_1", "dept_2")) %>%
   group_by(transaction_id) %>%
