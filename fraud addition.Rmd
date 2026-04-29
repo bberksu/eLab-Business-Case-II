@@ -2230,19 +2230,19 @@ geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
 
 
 
-# Fraud risk detection on unseen data: case1
+# Fraud risk detection on unseen data: case0
 
 ```{r}
-## Fraud detection on unseen data: case1 (didnt checked!!!!)
+## Fraud detection on unseen data: case0
 
-lines <- readLines("~/Desktop/supermarket case/case1.csv", warn = FALSE)
+lines <- readLines("~/Desktop/supermarket case/case0.csv", warn = FALSE)
 
-case1_raw <- tibble(
+case0_raw <- tibble(
   transaction_id = 1:length(lines),
   basket = lines
 )
 
-case1_long <- case1_raw %>%
+case0_long <- case0_raw %>%
   separate_rows(basket, sep = ",") %>%
   mutate(basket = str_trim(basket)) %>%
   separate(
@@ -2266,7 +2266,7 @@ case1_long <- case1_raw %>%
     price >= 0
   )
 
-case1_basket <- case1_long %>%
+case0_basket <- case0_long %>%
   group_by(transaction_id) %>%
   summarise(
     total_items = n(),
@@ -2282,19 +2282,19 @@ case1_basket <- case1_long %>%
   )
 
 # Co-occurrence score for case1 using scores learned from original data
-case1_dept_data <- case1_long %>%
+case0_dept_data <- case0_long %>%
   select(transaction_id, department_name) %>%
   distinct()
 
-case1_pairs <- case1_dept_data %>%
-  inner_join(case1_dept_data, by = "transaction_id") %>%
+case0_pairs <- case0_dept_data %>%
+  inner_join(case0_dept_data, by = "transaction_id") %>%
   filter(department_name.x < department_name.y) %>%
   rename(
     dept_1 = department_name.x,
     dept_2 = department_name.y
   )
 
-case1_co_score <- case1_pairs %>%
+case0_co_score <- case10_pairs %>%
   left_join(co_occurrence %>% select(dept_1, dept_2, score),
             by = c("dept_1", "dept_2")) %>%
   group_by(transaction_id) %>%
@@ -2303,8 +2303,8 @@ case1_co_score <- case1_pairs %>%
     .groups = "drop"
   )
 
-case1_basket <- case1_basket %>%
-  left_join(case1_co_score, by = "transaction_id") %>%
+case0_basket <- case0_basket %>%
+  left_join(case0_co_score, by = "transaction_id") %>%
   mutate(
     co_occurrence_score = replace_na(co_occurrence_score, 0),
     
@@ -2317,7 +2317,7 @@ case1_basket <- case1_basket %>%
     price_concentration = max_price / total_price
   )
 
-case1_basket <- case1_basket %>%
+case0_basket <- case0_basket %>%
   mutate(
     fast_scan = avg_time_per_item < p5_time,
     slow_scan = avg_time_per_item > p95_time,
@@ -2343,14 +2343,13 @@ case1_basket <- case1_basket %>%
     
 
     final_score =
-  risk_score * 1.8 +
-  as.numeric(scale(total_price)) * 2.2 +
-  as.numeric(scale(abs(price_deviation))) * 1 +
-  as.numeric(scale(abs(time_deviation))) * 0.6 +
-  as.numeric(scale(price_concentration)) * 0.5
+risk_score * 2
++ scale(total_price)
++ scale(abs(price_deviation))
++ scale(abs(time_deviation)) * 0.5
 )
 
-top_150 <- case1_basket %>%
+top_150 <- case0_basket %>%
   arrange(desc(final_score)) %>%
   slice_head(n = 150)
 
@@ -2359,77 +2358,16 @@ writeLines(as.character(top_150$transaction_id))
 
 ```{r}
 summary(basket_data$avg_time_per_item)
-summary(case1_basket$avg_time_per_item)
+summary(case0_basket$avg_time_per_item)
 
 summary(basket_data$total_price)
-summary(case1_basket$total_price)
+summary(case0_basket$total_price)
 
 summary(basket_data$total_items)
-summary(case1_basket$total_items)
+summary(case0_basket$total_items)
 
 ggplot() +
   geom_density(data = basket_data, aes(avg_time_per_item), color = "blue") +
   geom_density(data = case0_basket, aes(avg_time_per_item), color = "red") +
   labs(title = "Train vs Case1: Scan time")
-```
-# Isolation Forest 
-
-```{r}
-# 1. Features для модели
-X <- basket_risk %>%
-  select(
-    total_items,
-    total_price,
-    avg_time_per_item,
-    sd_time_per_item,
-    price_residual,
-    price_concentration
-  ) %>%
-  scale()
-
-# 2. Isolation Forest
-iso_model <- isolation.forest(
-  X,
-  ntrees = 100,
-  sample_size = 256,
-  ndim = 1
-)
-
-# 3. Anomaly scores
-basket_risk$if_score <- predict(
-  iso_model,
-  X,
-  type = "score"
-)
-
-# 4. Flag top 2% as anomalies
-threshold <- quantile(basket_risk$if_score, 0.98, na.rm = TRUE)
-
-basket_risk <- basket_risk %>%
-  mutate(
-    if_anomaly = if_score >= threshold
-  )
-
-# 5. Check results
-table(basket_risk$if_anomaly)
-
-table(
-  rule_based = basket_risk$risk_score >= 3,
-  isolation_forest = basket_risk$if_anomaly
-)
-
-basket_risk %>%
-  arrange(desc(if_score)) %>%
-  select(
-    transaction_id,
-    total_items,
-    total_price,
-    avg_time_per_item,
-    price_residual,
-    price_concentration,
-    risk_score,
-    if_score,
-    if_anomaly
-  ) %>%
-  head(20)
 ```
