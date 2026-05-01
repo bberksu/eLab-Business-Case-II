@@ -1,0 +1,195 @@
+---
+title: "Time-Based Anomaly Detection (LOF Approach)"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(dbscan)      
+library(knitr)       
+library(kableExtra)  
+```
+
+
+```{r}
+# Load the raw data
+lines <- readLines("C:/Users/Dirk/Downloads/supermarket/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+# Parse into long format
+long_data_clean <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price)
+  ) %>%
+  filter(!is.na(department), !is.na(time), !is.na(price), time >= 0, price >= 0)
+```
+
+
+
+```{r}
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(sd_time_per_item = replace_na(sd_time_per_item, 0))
+
+# Expected time given basket size
+model_time <- lm(avg_time_per_item ~ total_items, data = basket_data)
+
+# Expected price given basket size
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+# Calculate Residuals and Deviations
+basket_risk <- basket_data %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = .),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+    
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items,
+    price_residual = residuals(model_price),
+    price_concentration = max_price / total_price
+  )
+```
+
+
+
+```{r}
+p5_time  <- quantile(basket_risk$avg_time_per_item, 0.05, na.rm = TRUE)
+p95_time <- quantile(basket_risk$avg_time_per_item, 0.95, na.rm = TRUE)
+p5_price  <- quantile(basket_risk$total_price, 0.05, na.rm = TRUE)
+p95_price <- quantile(basket_risk$total_price, 0.95, na.rm = TRUE)
+p5_resid  <- quantile(basket_risk$price_residual, 0.05, na.rm = TRUE)
+p95_resid <- quantile(basket_risk$price_residual, 0.95, na.rm = TRUE)
+p95_conc <- quantile(basket_risk$price_concentration, 0.95, na.rm = TRUE)
+
+basket_risk <- basket_risk %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+    low_total_price = total_price < p5_price,
+    high_total_price = total_price > p95_price,
+    unusually_cheap_for_size = price_residual < p5_resid,
+    unusually_expensive_for_size = price_residual > p95_resid,
+    high_price_concentration = price_concentration > p95_conc,
+    
+    risk_score = 
+      as.integer(fast_scan) + as.integer(slow_scan) + 
+      as.integer(low_total_price) + as.integer(high_total_price) + 
+      as.integer(unusually_cheap_for_size) + as.integer(unusually_expensive_for_size) + 
+      as.integer(high_price_concentration)
+  )
+```
+
+
+
+```{r}
+# Select and scale the specific Time Features
+X_time <- basket_risk %>%
+  select(
+    avg_time_per_item,
+    sd_time_per_item,
+    time_deviation
+  ) %>%
+  scale()
+
+# Execute Local Outlier Factor
+set.seed(123)
+lof_time_scores <- dbscan::lof(X_time, minPts = 20)
+
+# Define threshold and flag anomalies (98th percentile)
+lof_time_threshold <- quantile(lof_time_scores, 0.98, na.rm = TRUE)
+
+basket_risk <- basket_risk %>%
+  mutate(
+    time_lof_score = lof_time_scores,
+    time_lof_anomaly = time_lof_score >= lof_time_threshold
+  )
+```
+
+
+
+```{r}
+
+table(
+  rule_based_risk = basket_risk$risk_score >= 3,
+  time_lof_anomaly = basket_risk$time_lof_anomaly
+)
+```
+
+
+
+```{r}
+ggplot(basket_risk, aes(x = avg_time_per_item, y = time_deviation)) +
+  geom_point(
+    data = basket_risk %>% filter(!time_lof_anomaly),
+    color = "#B0BEC5",
+    alpha = 0.3,
+    size = 1.5
+  ) +
+  geom_point(
+    data = basket_risk %>% filter(time_lof_anomaly),
+    color = "#D32F2F",
+    alpha = 0.8,
+    size = 2.5
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_x_log10(labels = label_comma()) +
+  labs(
+    title = "LOF-Detected Time Anomalies",
+    subtitle = "Red points indicate highly irregular time behaviors (density anomalies)",
+    x = "Average time per item (seconds, log scale)",
+    y = "Time Deviation from Expected (seconds)"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+```
