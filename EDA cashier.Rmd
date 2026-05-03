@@ -1,0 +1,969 @@
+---
+title: "cashier"
+output: html_document
+date: "2026-05-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(hexbin)
+```
+ 
+# Cleaning
+ 
+```{r}
+lines <- readLines("C:/Users/nicol/OneDrive/universita/elab 2/supermarket/cashier_data.csv", warn = FALSE)
+
+cashier_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+head(cashier_raw)
+```
+
+## Transfotmation into a structured format 
+
+```{r}
+long_data_cashier <- cashier_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    price = as.numeric(price)
+  )
+
+head(long_data_cashier)
+str(long_data_cashier)
+summary(long_data_cashier)
+length(unique(long_data_cashier$transaction_id))
+```
+
+## Mapping
+
+```{r}
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data_cashier <- long_data_cashier %>%
+  mutate(department_name = dept_map[as.character(department)])
+
+head(long_data_cashier)
+```
+
+## Data Cleaning
+
+```{r}
+long_data_cashier_clean <- long_data_cashier %>%
+  filter(
+    !is.na(department),
+    !is.na(price),
+    price >= 0
+  ) 
+```
+
+## Descriptive Analysis of Basket Characteristics
+
+```{r}
+basket_data_cashier <- long_data_cashier_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+head(basket_data_cashier)
+str(basket_data_cashier)
+summary(basket_data_cashier)
+```
+
+## Summary Statistic Table 
+
+```{r}
+stats_table_cashier <- basket_data_cashier %>%
+  select(total_items, total_price) %>%
+  pivot_longer(cols = everything(), names_to = "Metric", values_to = "Value") %>%
+  group_by(Metric) %>%
+  summarise(
+    Mean = mean(Value, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE),
+    P25 = quantile(Value, 0.25, na.rm = TRUE),
+    P75 = quantile(Value, 0.75, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE)
+  )
+
+stats_table_cashier <- stats_table_cashier %>%
+  mutate(Metric = recode(Metric,
+    total_items = "Number of items",
+    total_price = "Total price (€)",
+   ),
+  across(-Metric, ~round(.x, 2))
+  )
+
+kable(stats_table_cashier, digits = 2, align = "lrrrrrr",
+      caption = "Summary statistics of customer basket behavior", booktabs = TRUE) %>%
+  kable_styling(
+    latex_options = c("hold_position", "striped"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  column_spec(1, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "Statistics" = 6))
+```
+
+# EDA
+## Basket Analysis (basket size)
+### Distribution of Basket Size 
+
+```{r}
+ggplot(basket_data_cashier, aes(x = total_items)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 binwidth = 2,
+                 fill = "lightblue",
+                 color = "white",
+                 alpha = 0.8) +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(aes(xintercept = median(total_items)),
+             linetype = "dashed",
+             linewidth = 1) +
+  labs(
+    title = "Distribution of basket size",
+    subtitle = "Dashed line indicates median",
+    x = "Number of items",
+    y = "Density"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Distribution very similar to the self scan dataset with peaks around 20 items and then gradually tapers off to the right.
+
+### Distribution of Total Basket Value
+
+```{r}
+ggplot(basket_data_cashier, aes(x = total_price)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 40,
+                 fill = "pink",
+                 color = "white",
+                 alpha = 0.8) +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(aes(xintercept = median(total_price, na.rm = TRUE)),
+             linetype = "dashed",
+             linewidth = 1) +
+  coord_cartesian(
+    xlim = c(0, quantile(basket_data_cashier$total_price, 0.99, na.rm = TRUE))
+  ) +
+  labs(
+    title = "Distribution of total basket value",
+    subtitle = "Top 1% of extreme values hidden for readability; dashed line indicates median",
+    x = "Total price (€)",
+    y = "Density"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggplot(basket_data_cashier, aes(x = total_price)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 40,
+                 fill = "pink",
+                 color = "white",
+                 alpha = 0.8) +
+  labs(title = "Distribution of total basket value", x = "Total Price (€)", y = "Count") +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The density plots shows that self-scan transactions have a slightly higher median and a wider distribution compared to traditional checkout transactions. The right tail is more pronounced for self-scan, indicating a higher frequency of large basket values. This suggests that customers using self-scan tend to spend more and exhibit greater variability in their spending behavior, while traditional checkout transactions are more concentrated around lower values.
+The self-scan distribution shows a more pronounced right tail and a wider spread compared to the traditional checkout. This suggests that self-scan users tend to have slightly higher and more variable basket values, including more high-spending transactions. In contrast, traditional checkout transactions are more concentrated around lower values, indicating more routine or smaller purchases.
+
+### Boxplots of Basket Size and Total Basket Value
+
+```{r}
+ggplot(basket_data_cashier, aes(y = total_items)) +
+  geom_boxplot(fill = "lavender", alpha = 0.7, outlier.alpha = 0.2) +
+  labs(
+    title = "Distribution of Basket Size",
+    y = "Number of items"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+Self-scan baskets are slightly larger and more variable, with more extreme values, while traditional checkout baskets are smaller and more concentrated.
+
+```{r}
+ggplot(basket_data_cashier, aes(y = total_price)) +
+  geom_boxplot(fill = "lightyellow", alpha = 0.7, outlier.alpha = 0.2) +
+  labs(
+    title = "Distribution of Total Basket Value",
+    y = "Total price (€)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+Self-scan transactions show higher and more variable total spending, with more extreme high-value outliers, while traditional checkout transactions are lower and more concentrated.
+
+### Relationship Between Basket Size and Total Spend
+
+```{r}
+ggplot(basket_data_cashier, aes(x = total_items, y = total_price)) +
+  geom_hex(bins = 35) +
+  geom_smooth(aes(color = "Linear trend (LM)"),
+              method = "lm",
+              linetype = "dashed",
+              se = FALSE) +
+  scale_color_manual(
+    values = c("Linear trend (LM)" = "red"),
+    name = "Trend type"
+  ) +
+  scale_fill_viridis_c(name = "Count") +
+  labs(
+    title = "Relationship between basket size and total spend",
+    subtitle = "Hexagonal density plot with linear trend",
+    x = "Number of items",
+    y = "Total price (€)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Both show a positive relationship between basket size and spending, but self-scan transactions are more dispersed, indicating higher variability compared to the more stable pattern of traditional checkout.
+
+## DEPARTMENTS
+## Department Basket Share
+
+```{r analysis}
+total_baskets_cashier <- n_distinct(long_data_cashier_clean$transaction_id)
+
+cat("Total unique baskets:", total_baskets_cashier, "\n")
+
+dept_basket_share_cashier <- long_data_cashier_clean %>%
+  group_by(department_name) %>%
+  summarise(
+    basket_count = n_distinct(transaction_id),   # в скольких корзинах есть департамент
+    item_count   = n(),                          # сколько всего товаров этого департамента
+    avg_items_per_basket = round(item_count / basket_count, 2),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    basket_share_pct = round(basket_count / total_baskets_cashier * 100, 2)
+  ) %>%
+  arrange(desc(basket_share_pct))
+
+print(dept_basket_share_cashier, n = Inf)
+```
+The distribution across departments is largely similar between self-scan and traditional checkout, with only slight differences such as a higher share of Fruit & Vegetables in self-scan transactions.
+
+## Top 10 Departments
+
+```{r top10}
+top10 <- dept_basket_share_cashier %>%
+  slice_head(n = 10)
+
+cat("Top 10 departments by basket share:\n\n")
+
+for (i in seq_len(nrow(top10))) {
+  cat(sprintf(
+    "%2d. %-25s %6.2f%% of baskets\n",
+    i,
+    top10$department_name[i],
+    top10$basket_share_pct[i]
+  ))
+}
+```
+Same situation as before. 
+
+## Visualisations
+
+### All Departments Basket Share
+
+```{r plot-all}
+ggplot(dept_basket_share_cashier,
+       aes(x = reorder(department_name, basket_share_pct),
+           y = basket_share_pct)) +
+  geom_col(
+    fill = "#A7C7E7",
+    color = "#2C3E50",
+    width = 0.7,
+    alpha = 0.85
+  ) +
+  geom_text(
+    aes(label = paste0(basket_share_pct, "%")),
+    hjust = -0.1,
+    size = 3.2,
+    family = "serif"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+  limits = c(0, max(dept_basket_share_cashier$basket_share_pct, na.rm = TRUE) * 1.12),
+  labels = function(x) paste0(x, "%")
+) +
+labs(
+  title = "Department Presence Across Customer Baskets",
+  subtitle = paste0("n = ", format(total_baskets_cashier, big.mark = ","), " unique transactions"),
+  x = NULL,
+  y = "% of baskets containing department"
+) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+```{r}
+# REMOVE DUPLICATES WITHIN TRANSACTION
+dept_data_cashier <- long_data_cashier %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+# CREATE CO-OCCURRENCE PAIRS
+pairs <- dept_data_cashier %>%
+  inner_join(dept_data_cashier, by = "transaction_id") %>%
+  filter(department_name.x != department_name.y) %>%
+  mutate(
+    dept_1 = pmin(department_name.x, department_name.y),
+    dept_2 = pmax(department_name.x, department_name.y)
+  ) %>%
+  distinct(transaction_id, dept_1, dept_2)
+
+# COUNT PAIRS
+co_occurrence_cashier <- pairs %>%
+  count(dept_1, dept_2, sort = TRUE)
+
+head(co_occurrence_cashier, 10)
+```
+
+
+```{r}
+#CO-OCCURRENCE PER DEPARTMENT
+co_by_dept_cashier <- bind_rows(
+  co_occurrence_cashier %>%
+    transmute(
+      department = dept_1,
+      partner = dept_2,
+      n = n
+    ),
+  co_occurrence_cashier %>%
+    transmute(
+      department = dept_2,
+      partner = dept_1,
+      n = n
+    )
+) %>%
+  group_by(department) %>%
+  slice_max(order_by = n, n = 4, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(department, desc(n))
+
+co_by_dept_cashier
+```
+Co-occurrence patterns are consistent across self-scan and traditional checkout, with the same dominant product combinations, suggesting similar purchasing behavior.
+
+```{r}
+library(tidyr)
+
+depts_cashier <- unique(c(co_occurrence_cashier$dept_1, co_occurrence_cashier$dept_2))
+
+heatmap_data_cashier <- co_occurrence_cashier %>%
+  bind_rows(
+    co_occurrence_cashier %>%
+      transmute(dept_1 = dept_2, dept_2 = dept_1, n = n)
+  ) %>%
+  bind_rows(
+    tibble(
+      dept_1 = depts_cashier,
+      dept_2 = depts_cashier,
+      n = 0
+    )
+  ) %>%
+  distinct(dept_1, dept_2, .keep_all = TRUE)
+
+ggplot(heatmap_data_cashier, aes(x = dept_1, y = dept_2, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "C", name = "Co-occurrence") +
+  labs(
+    title = "Co-occurrence Heatmap of Departments",
+    subtitle = "Frequency of departments appearing together in baskets",
+    x = "Department",
+    y = "Department"
+  ) +
+  theme_minimal(base_size = 12, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+top_depts_cashier <- dept_basket_share_cashier %>%
+  slice_max(basket_share_pct, n = 10) %>%
+  pull(department_name)
+
+heatmap_top_cashier <- heatmap_data_cashier %>%
+  filter(
+    dept_1 %in% top_depts_cashier,
+    dept_2 %in% top_depts_cashier
+  )
+
+ggplot(heatmap_top_cashier, aes(x = dept_1, y = dept_2, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "C", name = "Co-occurrence") +
+  labs(
+    title = "Co-occurrence Heatmap (Top 10 Departments)",
+    subtitle = "Frequency of departments appearing together in baskets",
+    x = "Department",
+    y = "Department"
+  ) +
+  theme_minimal(base_size = 13, base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+```
+
+```{r}
+# CONDITIONAL CO-OCCURRENCE: P(partner | department)
+total_transactions <- n_distinct(long_data_cashier_clean$transaction_id)
+
+dept_freq_cashier <- long_data_cashier_clean %>%
+  distinct(transaction_id, department_name) %>%
+  count(department_name, name = "dept_count") %>%
+  mutate(
+    dept_share = dept_count / total_transactions
+  )
+
+co_occurrence_conditional_cashier <- bind_rows(
+  co_occurrence_cashier %>%
+    transmute(department = dept_1, partner = dept_2, pair_count = n),
+  co_occurrence_cashier %>%
+    transmute(department = dept_2, partner = dept_1, pair_count = n)
+) %>%
+  left_join(dept_freq_cashier, by = c("department" = "department_name")) %>%
+  mutate(
+    conditional_prob_cashier = pair_count / dept_count,
+    conditional_prob_pct = round(conditional_prob_cashier * 100, 1)
+  ) %>%
+  arrange(desc(conditional_prob_cashier))
+
+co_occurrence_conditional_cashier %>%
+  select(department, partner, pair_count, dept_count, conditional_prob_pct) %>%
+  head(10)
+```
+
+
+```{r}
+# TOP 5 PARTNERS PER DEPARTMENT - CASHIER
+co_by_dept_cashier <- co_occurrence_conditional_cashier %>%
+  group_by(department) %>%
+  slice_max(order_by = conditional_prob_cashier, n = 5, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(department, partner, pair_count, conditional_prob_pct) %>%
+  arrange(department, desc(conditional_prob_pct))
+
+co_by_dept_cashier
+```
+
+
+```{r}
+# FILTERED TOP 10 RELATIONSHIPS - CASHIER
+excluded_depts <- c(
+  "Fruit & Vegetables",
+  "Books & Magazines",
+  "Care & Hygiene",
+  "Household & Pet"
+)
+
+top10_filtered_cashier <- co_occurrence_conditional_cashier %>%
+  filter(
+    !department %in% excluded_depts,
+    !partner %in% excluded_depts
+  ) %>%
+  arrange(desc(conditional_prob_cashier)) %>%
+  slice_head(n = 10) %>%
+  select(department, partner, pair_count, conditional_prob_pct)
+
+top10_filtered_cashier
+```
+
+
+```{r}
+top10_conditional_cashier <- co_occurrence_conditional_cashier %>%
+  slice_max(conditional_prob_cashier, n = 10)
+
+ggplot(top10_conditional_cashier,
+       aes(x = reorder(paste(department, partner, sep = " → "),
+                       conditional_prob_cashier),
+           y = conditional_prob_pct)) +
+  geom_col(
+    fill = "#6C9BCF",
+    color = "#2C3E50",
+    alpha = 0.85
+  ) +
+  coord_flip() +
+  labs(
+    title = "Top Conditional Relationships Between Departments",
+    subtitle = "P(partner | department)",
+    x = "Department pair",
+    y = "Conditional probability (%)"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+  
+The cashier dataset shows strong conditional co-occurrence patterns, especially between Special Diet and Sauces & Spices, Dairy & Eggs and Cereals & Spreads, and Dairy & Eggs and Sauces & Spices. These results suggest that customers often buy complementary departments together.
+
+#ANOMALIES
+
+## Summary Statistics for Price-Related Basket Features
+
+This table gives a compact overview of the main price-related variables that will be used in the anomaly exploration.
+
+```{r price_summary_table_cashier}
+basket_data_cashier <- basket_data_cashier %>%
+  mutate(
+    avg_price_per_item = avg_price,
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+price_stats_cashier <- basket_data_cashier %>%
+  select(
+    total_items,
+    total_price,
+    avg_price_per_item,
+    max_price,
+    max_price_share,
+    unique_departments
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "value") %>%
+  group_by(metric) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    p25 = quantile(value, 0.25, na.rm = TRUE),
+    p75 = quantile(value, 0.75, na.rm = TRUE),
+    p95 = quantile(value, 0.95, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    metric = recode(metric,
+      total_items = "Number of items",
+      total_price = "Total basket price (€)",
+      avg_price_per_item = "Average item price (€)",
+      max_price = "Maximum item price (€)",
+      max_price_share = "Share of basket value from most expensive item",
+      unique_departments = "Unique departments"
+    ),
+    across(where(is.numeric), ~ round(.x, 2))
+  )
+
+kable(price_stats_cashier,
+      caption = "Summary statistics for key price-based basket variables",
+      booktabs = TRUE,
+      align = "lrrrrrr") %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+Self-scan baskets show slightly higher total and maximum prices, with more extreme values, while overall basket composition remains similar to traditional checkout.
+
+## Price-Based Anomaly Exploration
+
+### Very Low / Very High Total Basket Value
+
+```{r}
+library("scales")
+```
+
+
+```{r total_price_distribution_cashier}
+# Visualise total basket value in two ways:
+# 1) boxplot for outliers
+# 2) histogram on a log scale because the distribution is right-skewed
+
+ggplot(basket_data_cashier, aes(y = total_price)) +
+  geom_boxplot(fill = "skyblue", outlier.color = "red", outlier.shape = 16) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Total Basket Price",
+    subtitle = "Potential outliers are highlighted by the boxplot rule",
+    y = "Total basket price (€)"
+  )
+
+ggplot(basket_data_cashier, aes(x = total_price)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white") +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  theme_minimal() +
+  labs(
+    title = "Histogram of Total Basket Price (log scale)",
+    subtitle = "The log scale makes the long right tail easier to inspect",
+    x = "Total basket price (€, log scale)",
+    y = "Number of baskets"
+  )
+```
+Self-scan transactions exhibit higher spending levels and more extreme high-value outliers, while the overall distribution shape remains similar to traditional checkout when viewed on a log scale.
+
+```{r total_price_thresholds_cashier}
+# Compute two sets of anomaly thresholds for total basket value.
+
+price_q01 <- quantile(basket_data_cashier$total_price, 0.01, na.rm = TRUE)
+price_q99 <- quantile(basket_data_cashier$total_price, 0.99, na.rm = TRUE)
+
+price_q1  <- quantile(basket_data_cashier$total_price, 0.25, na.rm = TRUE)
+price_q3  <- quantile(basket_data_cashier$total_price, 0.75, na.rm = TRUE)
+price_iqr <- IQR(basket_data_cashier$total_price, na.rm = TRUE)
+
+price_lower_iqr <- price_q1 - 1.5 * price_iqr
+price_upper_iqr <- price_q3 + 1.5 * price_iqr
+
+price_thresholds_cashier <- tibble(
+  threshold = c("1st percentile", "99th percentile", "Lower IQR bound", "Upper IQR bound"),
+  value = c(price_q01, price_q99, price_lower_iqr, price_upper_iqr)
+)
+
+kable(price_thresholds_cashier %>% mutate(value = round(value, 2)),
+      caption = "Thresholds used to flag unusually cheap or expensive baskets",
+      booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+Self-scan transactions show slightly wider dispersion, with both lower minimum thresholds and higher upper bounds, indicating more variability compared to traditional checkout.
+
+```{r total_price_flags_cashier}
+# Flag baskets that are extreme in terms of total price.
+
+extreme_total_price_baskets_cashier <- basket_data_cashier %>%
+  mutate(
+    total_price_flag = case_when(
+      total_price <= price_q01 ~ "Very low total price (bottom 1%)",
+      total_price >= price_q99 ~ "Very high total price (top 1%)",
+      total_price < price_lower_iqr ~ "Low total price (IQR rule)",
+      total_price > price_upper_iqr ~ "High total price (IQR rule)",
+      TRUE ~ "Typical"
+    )
+  ) %>%
+  filter(total_price_flag != "Typical") %>%
+  arrange(desc(total_price))
+
+extreme_total_price_baskets_cashier %>%
+  count(total_price_flag)
+```
+```{r}
+extreme_total_price_baskets_cashier %>%
+  count(total_price_flag) %>%
+  mutate(pct = n / sum(n) * 100)
+```
+When expressed as percentages, both datasets show very similar distributions of extreme baskets. Self-scan transactions exhibit slightly more low-value extremes, while traditional checkout shows a slightly higher share of high-value extremes.
+
+```{r total_price_examples}
+# Show a few concrete examples of the most extreme baskets (cashier)
+
+head(extreme_total_price_baskets_cashier %>%
+       select(transaction_id, total_items, total_price, max_price, unique_departments, total_price_flag), 15) %>%
+  kable(caption = "Example baskets flagged for unusually low or high total value",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+### Basket Value Relative to Basket Size
+
+```{r price_vs_items_plot_cashier}
+# Plot the relationship between basket size and basket value.
+# A smooth trend line helps reveal the normal price pattern.
+
+ggplot(basket_data_cashier, aes(x = total_items, y = total_price)) +
+  geom_point(alpha = 0.15, color = "darkorange") +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "Total Basket Price versus Basket Size",
+    subtitle = "Baskets far above or below the general trend may be price anomalies",
+    x = "Number of items",
+    y = "Total basket price (€)"
+  )
+```
+Both datasets show a clear positive relationship between basket size and total spend, but self-scan transactions exhibit greater dispersion, indicating higher variability compared to traditional checkout.
+
+
+```{r price_size_residuals_cashier}
+# Fit a simple linear benchmark model.
+# The point is not perfect prediction but to identify baskets whose value
+# is much larger or smaller than expected given the number of items.
+
+price_size_model_cashier <- lm(total_price ~ total_items, data = basket_data_cashier)
+
+basket_data_cashier <- basket_data_cashier %>%
+  mutate(
+    expected_total_price = predict(price_size_model_cashier, newdata = basket_data_cashier),
+    price_residual = total_price - expected_total_price,
+    price_residual_z = as.numeric(scale(price_residual))
+  )
+
+summary(price_size_model_cashier)
+```
+The relationship between basket size and total spend is very similar across both datasets. However, self-scan transactions exhibit a slightly higher price per item and more extreme residuals, indicating greater variability and the presence of more anomalous baskets.
+
+```{r residual_plot_cashier}
+# Visualise the residual anomalies directly.
+# Positive residuals mean the basket is more expensive than expected.
+# Negative residuals mean the basket is cheaper than expected.
+
+ggplot(basket_data_cashier, aes(x = total_items, y = price_residual)) +
+  geom_point(alpha = 0.15, color = "firebrick") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(
+    yintercept = c(-2, 2) * sd(basket_data_cashier$price_residual, na.rm = TRUE),
+    linetype = "dotted",
+    color = "grey40"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Residual Basket Value after Controlling for Basket Size",
+    subtitle = "Large positive or negative residuals indicate baskets that are unusual for their size",
+    x = "Number of items",
+    y = "Residual total price (€)"
+  )
+```
+Self-scan transactions show a wider spread of residuals, with more extreme positive and negative deviations from the expected price, indicating greater variability and more anomalous baskets compared to traditional checkout.
+
+```{r residual_tables_cashier}
+# Flag baskets whose value is especially unusual given their size.
+
+residual_anomalies_cashier <- basket_data_cashier %>%
+  mutate(
+    residual_flag = case_when(
+      price_residual_z >= 3 ~ "Much more expensive than expected",
+      price_residual_z <= -3 ~ "Much cheaper than expected",
+      TRUE ~ "Typical"
+    )
+  ) %>%
+  filter(residual_flag != "Typical") %>%
+  arrange(desc(abs(price_residual_z)))
+
+head(residual_anomalies_cashier %>%
+       select(transaction_id, total_items, total_price, expected_total_price,
+              price_residual, price_residual_z, max_price, residual_flag), 15) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Baskets with unusually high or low value relative to basket size",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+### Expensive Items in Small Baskets
+
+```{r expensive_item_small_baskets_plot}
+# Plot basket size against the most expensive item in the basket.
+# The baskets of interest are located in the upper-left area:
+# few items, but one unusually expensive product.
+
+ggplot(basket_data_cashier, aes(x = total_items, y = max_price)) +
+  geom_point(alpha = 0.35, color = "darkred") +
+  theme_minimal() +
+  labs(
+    title = "Maximum Item Price versus Basket Size",
+    subtitle = "Small baskets with very expensive items are especially interesting",
+    x = "Number of items",
+    y = "Most expensive item in basket (€)"
+  )
+```
+Self-scan baskets show a higher presence of expensive items, even in smaller baskets, while traditional checkout transactions are more concentrated and less extreme.
+
+### Price Concentration: One Item Dominates the Basket
+
+```{r price_concentration_plot_cashier}
+# Plot how much of the basket value comes from the single most expensive item.
+
+ggplot(basket_data_cashier, aes(x = max_price_share)) +
+  geom_histogram(bins = 50, fill = "darkgreen", color = "white") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Max-Item Share in Basket Value",
+    subtitle = "Higher values indicate baskets dominated by one expensive item",
+    x = "Share of total basket value from the most expensive item",
+    y = "Number of baskets"
+  )
+```
+Self-scan baskets show a slightly heavier right tail, indicating a higher presence of baskets dominated by a single expensive item, while traditional checkout baskets are more evenly distributed.
+
+```{r price_concentration_flags_cashier}
+# Use the 95th percentile to flag unusually concentrated baskets.
+
+concentration_threshold_cashier <- quantile(basket_data_cashier$max_price_share, 0.95, na.rm = TRUE)
+
+concentrated_baskets_cashier <- basket_data_cashier %>%
+  filter(max_price_share >= concentration_threshold_cashier) %>%
+  arrange(desc(max_price_share), desc(max_price))
+
+head(concentrated_baskets_cashier %>%
+       select(transaction_id, total_items, total_price, max_price, max_price_share,
+              avg_price_per_item, unique_departments), 15) %>%
+  mutate(
+    max_price_share = percent(max_price_share, accuracy = 0.1),
+    across(c(total_price, max_price, avg_price_per_item), ~ round(.x, 2))
+  ) %>%
+  kable(caption = "Baskets where one item dominates total basket value",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## Combining Price Signals into a Candidate Risk Score
+```{r}
+high_price_threshold_cashier <- quantile(
+  basket_data_cashier$max_price,
+  0.95,
+  na.rm = TRUE
+)
+
+concentration_threshold_cashier <- quantile(
+  basket_data_cashier$max_price_share,
+  0.95,
+  na.rm = TRUE
+)
+```
+
+
+```{r combined_price_score_cashier}
+# Combine the main price anomaly signals into one transparent score.
+# Each triggered flag contributes one point.
+
+price_anomaly_candidates_cashier <- basket_data_cashier %>%
+  mutate(
+    flag_extreme_total_price = total_price <= price_q01 | total_price >= price_q99,
+    flag_price_size_residual = abs(price_residual_z) >= 3,
+    flag_expensive_small = total_items <= 3 & max_price >= high_price_threshold_cashier,
+    flag_concentrated = max_price_share >= concentration_threshold_cashier,
+    price_anomaly_score =
+      as.integer(flag_extreme_total_price) +
+      as.integer(flag_price_size_residual) +
+      as.integer(flag_expensive_small) +
+      as.integer(flag_concentrated)
+  ) %>%
+  arrange(desc(price_anomaly_score), desc(total_price), desc(max_price))
+
+price_anomaly_candidates_cashier %>%
+  count(price_anomaly_score) %>%
+  kable(caption = "Distribution of combined price-based anomaly scores",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+The distribution of the combined anomaly score is remarkably similar across both datasets. However, self-scan transactions show a slightly higher proportion of higher-risk baskets, indicating a marginally greater presence of anomalous behavior.
+
+```{r top_candidates_table_cashier}
+# Inspect the top-ranked baskets according to the rule-based price anomaly score.
+
+head(price_anomaly_candidates_cashier %>%
+       filter(price_anomaly_score >= 2) %>%
+       select(transaction_id, total_items, total_price, expected_total_price,
+              price_residual_z, max_price, max_price_share,
+              unique_departments, price_anomaly_score), 20) %>%
+  mutate(
+    across(c(total_price, expected_total_price, price_residual_z, max_price), ~ round(.x, 2)),
+    max_price_share = percent(max_price_share, accuracy = 0.1)
+  ) %>%
+  kable(caption = "Top candidate baskets based on multiple price anomaly signals",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## Drill-Down: Item Composition of Top Candidate Baskets
+
+
+```{r drill_down_candidates_cashier}
+# Select a few of the strongest candidate baskets for manual inspection.
+
+top_candidate_ids_cashier <- price_anomaly_candidates_cashier %>%
+  filter(price_anomaly_score >= 2) %>%
+  slice_head(n = 10) %>%
+  pull(transaction_id)
+
+candidate_item_view_cashier <- long_data_cashier_clean %>%
+  filter(transaction_id %in% top_candidate_ids_cashier) %>%
+  arrange(transaction_id, desc(price)) %>%
+  select(transaction_id, department_name, price)
+
+head(candidate_item_view_cashier, 30) %>%
+  kable(caption = "Item-level drill-down for selected top candidate baskets",
+        booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## Conclusion
+The analysis of the cashier dataset confirms that customer purchasing behaviour is largely consistent with what is observed in the self-scan environment. Across both datasets, the fundamental structure of transactions remains stable: basket size distributions are similar, total spending follows a right-skewed pattern, and there is a clear positive relationship between the number of items and total basket value. This indicates that the checkout method does not fundamentally alter how customers build their baskets, but rather reflects an underlying, stable consumption behaviour.
+
+At the same time, some differences emerge when focusing on variability and extreme cases. Self-scan transactions tend to exhibit slightly greater dispersion, with more pronounced tails in the distribution of total prices and more extreme residual values relative to expected spending. In contrast, cashier transactions appear more concentrated and predictable, with fewer outliers and a tighter relationship between basket size and value. This suggests that while the average behaviour is the same, self-scan environments allow for more variability, potentially due to lower supervision or a more flexible shopping experience.
+
+The anomaly detection analysis reinforces this interpretation. The vast majority of baskets in both datasets are classified as normal, with very similar proportions of low-risk transactions. However, self-scan transactions show a marginally higher presence of higher anomaly scores, indicating a slightly greater occurrence of unusual patterns such as extreme total prices, strong deviations from expected spending, or baskets dominated by a single expensive item. Importantly, the same types of anomalies are found in both datasets, which implies that these patterns are not unique to one checkout method.
+
+This leads to a key insight regarding overlap between the two datasets. There is a strong overlap in all major behavioural dimensions: basket composition, department co-occurrence, price dynamics, and even the nature of anomalous transactions. In other words, the same purchasing mechanisms are at work in both environments. The difference lies not in the type of behaviour, but in its intensity. Self-scan does not introduce new kinds of anomalies; rather, it slightly amplifies patterns that already exist in traditional checkout transactions.
+
