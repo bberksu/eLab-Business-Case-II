@@ -1,0 +1,1508 @@
+---
+title: "Fraud Risk Scoring and Baseline"
+output: pdf_document
+date: "2026-04-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+source("prepare_data.R")
+```
+
+# MAIN BASELINE
+
+```{r}
+# 1. Fast / slow scan thresholds
+p5_time  <- quantile(basket_data$avg_time_per_item, 0.05, na.rm = TRUE)
+p95_time <- quantile(basket_data$avg_time_per_item, 0.95, na.rm = TRUE)
+
+# 2. Basket size group
+basket_data <- basket_data %>%
+  mutate(
+    fast_flag = avg_time_per_item < p5_time,
+    slow_flag = avg_time_per_item > p95_time,
+
+    basket_size_group = case_when(
+      total_items <= 10 ~ "small",
+      total_items <= 25 ~ "medium",
+      TRUE ~ "large"
+    )
+  )
+
+# 3. Expected time given basket size
+model_time <- lm(avg_time_per_item ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = basket_data),
+    time_deviation = avg_time_per_item - expected_time_given_size
+  )
+
+# 4. Expected price given basket size
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items,
+    price_residual = residuals(model_price),
+    price_concentration = max_price / total_price
+  )
+```
+
+```{r}
+# 5. Department co-occurrence score
+dept_data <- long_data_clean %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+pairs <- dept_data %>%
+  inner_join(dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y) %>%
+  rename(
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+co_occurrence <- pairs %>%
+  count(dept_1, dept_2, sort = TRUE) %>%
+  mutate(score = n / max(n))
+
+pairs_scored <- pairs %>%
+  left_join(co_occurrence, by = c("dept_1", "dept_2"))
+
+co_score <- pairs_scored %>%
+  group_by(transaction_id) %>%
+  summarise(
+    co_occurrence_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(co_score, by = "transaction_id") %>%
+  mutate(
+    co_occurrence_score = replace_na(co_occurrence_score, 0)
+  )
+```
+
+```{r}
+# 6. Thresholds for risk rules
+p5_price  <- quantile(basket_data$total_price, 0.05, na.rm = TRUE)
+p95_price <- quantile(basket_data$total_price, 0.95, na.rm = TRUE)
+
+p5_resid  <- quantile(basket_data$price_residual, 0.05, na.rm = TRUE)
+p95_resid <- quantile(basket_data$price_residual, 0.95, na.rm = TRUE)
+
+p95_conc <- quantile(basket_data$price_concentration, 0.95, na.rm = TRUE)
+
+p5_co <- quantile(basket_data$co_occurrence_score, 0.05, na.rm = TRUE)
+
+# 7. Rule-based risk score
+basket_risk <- basket_data %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+
+    low_total_price = total_price < p5_price,
+    high_total_price = total_price > p95_price,
+
+    unusually_cheap_for_size = price_residual < p5_resid,
+    unusually_expensive_for_size = price_residual > p95_resid,
+
+    high_price_concentration = price_concentration > p95_conc,
+
+    unusual_department_combination = co_occurrence_score < p5_co,
+
+    risk_score =
+      as.integer(fast_scan) +
+      as.integer(slow_scan) +
+      as.integer(low_total_price) +
+      as.integer(high_total_price) +
+      as.integer(unusually_cheap_for_size) +
+      as.integer(unusually_expensive_for_size) +
+      as.integer(high_price_concentration) +
+      as.integer(unusual_department_combination)
+  ) %>%
+  arrange(desc(risk_score))
+```
+
+```{r}
+table(basket_risk$risk_score)
+
+top_risky <- basket_risk %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    time_deviation,
+    price_deviation,
+    price_concentration,
+    co_occurrence_score,
+    risk_score
+  ) %>%
+  arrange(desc(risk_score)) %>%
+  head(20)
+
+knitr::kable(top_risky)
+
+basket_risk %>%
+  group_by(risk_score) %>%
+  summarise(
+    avg_time = mean(avg_time_per_item),
+    avg_price = mean(total_price),
+    avg_items = mean(total_items),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  top_risky,
+  "~/Desktop/supermarket case/test cases/top_risky"
+)
+```
+
+```{r}
+ggplot() +
+  geom_point(
+    data = basket_risk %>% filter(risk_score <= 1),
+    aes(avg_time_per_item, total_price),
+    color = "#B0BEC5",
+    alpha = 0.08,
+    size = 1
+  ) +
+  geom_point(
+    data = basket_risk %>% filter(risk_score == 2),
+    aes(avg_time_per_item, total_price),
+    color = "#42A5F5",
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  geom_point(
+    data = basket_risk %>% filter(risk_score == 3),
+    aes(avg_time_per_item, total_price),
+    color = "#8E24AA",
+    alpha = 0.4,
+    size = 2
+  ) +
+  geom_point(
+    data = basket_risk %>% filter(risk_score >= 4),
+    aes(avg_time_per_item, total_price),
+    color = "#D32F2F",
+    size = 3
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "Customer behavior and fraud risk",
+    subtitle = "High-risk transactions clearly deviate from normal patterns",
+    x = "Average time per item (seconds)",
+    y = "Total basket value (€)"
+  ) +
+  geom_vline(xintercept = 150, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Fraud risk detection on unseen data: case0
+
+```{r}
+case0_lines <- readLines("~/Desktop/case0.csv", warn = FALSE)
+
+case0_raw <- tibble(
+  transaction_id = 1:length(case0_lines),
+  basket = case0_lines
+)
+
+case0_long <- case0_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+case0_basket <- case0_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+```
+
+```{r}
+case0_dept_data <- case0_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+case0_pairs <- case0_dept_data %>%
+  inner_join(case0_dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y) %>%
+  rename(
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+case0_co_score <- case0_pairs %>%
+  left_join(
+    co_occurrence %>% select(dept_1, dept_2, score),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    co_occurrence_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+case0_basket <- case0_basket %>%
+  left_join(case0_co_score, by = "transaction_id") %>%
+  mutate(
+    co_occurrence_score = replace_na(co_occurrence_score, 0),
+
+    expected_time_given_size = predict(model_time, newdata = .),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items,
+
+    price_concentration = max_price / total_price
+  )
+```
+
+```{r}
+case0_basket <- case0_basket %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+
+    low_total_price = total_price < p5_price,
+    high_total_price = total_price > p95_price,
+
+    unusually_cheap_for_size = price_deviation < p5_resid,
+    unusually_expensive_for_size = price_deviation > p95_resid,
+
+    high_price_concentration = price_concentration > p95_conc,
+    unusual_department_combination = co_occurrence_score < p5_co,
+
+    risk_score =
+      as.integer(fast_scan) +
+      as.integer(slow_scan) +
+      as.integer(low_total_price) +
+      as.integer(high_total_price) +
+      as.integer(unusually_cheap_for_size) +
+      as.integer(unusually_expensive_for_size) +
+      as.integer(high_price_concentration) +
+      as.integer(unusual_department_combination),
+
+    final_score =
+      risk_score * 2 +
+      as.numeric(scale(total_price)) +
+      as.numeric(scale(abs(price_deviation))) +
+      as.numeric(scale(abs(time_deviation))) * 0.5
+  )
+
+top_150 <- case0_basket %>%
+  arrange(desc(final_score)) %>%
+  slice_head(n = 150)
+
+writeLines(as.character(top_150$transaction_id))
+
+readr::write_csv(
+  top_150,
+  "~/Desktop/supermarket case/test cases/top_150"
+)
+```
+
+```{r}
+summary(basket_data$avg_time_per_item)
+summary(case0_basket$avg_time_per_item)
+
+summary(basket_data$total_price)
+summary(case0_basket$total_price)
+
+summary(basket_data$total_items)
+summary(case0_basket$total_items)
+```
+
+```{r}
+ggplot() +
+  geom_density(data = basket_data, aes(avg_time_per_item), color = "blue") +
+  geom_density(data = case0_basket, aes(avg_time_per_item), color = "red") +
+  labs(
+    title = "Train vs Case0: Scan time",
+    x = "Average time per item",
+    y = "Density"
+  ) +
+  theme_minimal(base_family = "serif")
+```
+
+
+# BASELINE MODIFICATION
+
+```{r}
+# 1. Basket-level dataset
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# 2. Fast / slow scan thresholds
+p5_time  <- quantile(basket_data$avg_time_per_item, 0.05, na.rm = TRUE)
+p95_time <- quantile(basket_data$avg_time_per_item, 0.95, na.rm = TRUE)
+
+# 3. Basket size group
+basket_data <- basket_data %>%
+  mutate(
+    fast_flag = avg_time_per_item < p5_time,
+    slow_flag = avg_time_per_item > p95_time,
+
+    basket_size_group = case_when(
+      total_items <= 10 ~ "small",
+      total_items <= 25 ~ "medium",
+      TRUE ~ "large"
+    )
+  )
+
+# 4. Expected time given basket size
+model_time <- lm(avg_time_per_item ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = basket_data),
+    time_deviation = avg_time_per_item - expected_time_given_size
+  )
+
+# 5. Expected price given basket size
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items,
+    price_residual = residuals(model_price),
+    price_concentration = max_price / total_price
+  )
+
+# 6. Department co-occurrence score
+dept_data <- long_data_clean %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+pairs <- dept_data %>%
+  inner_join(dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y) %>%
+  rename(
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+co_occurrence <- pairs %>%
+  count(dept_1, dept_2, sort = TRUE) %>%
+  mutate(score = n / max(n))
+
+pairs_scored <- pairs %>%
+  left_join(co_occurrence, by = c("dept_1", "dept_2"))
+
+co_score <- pairs_scored %>%
+  group_by(transaction_id) %>%
+  summarise(
+    co_occurrence_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(co_score, by = "transaction_id") %>%
+  mutate(
+    co_occurrence_score = replace_na(co_occurrence_score, 0)
+  )
+
+# 7. Thresholds for risk rules
+p5_resid  <- quantile(basket_data$price_residual, 0.05, na.rm = TRUE)
+p95_resid <- quantile(basket_data$price_residual, 0.95, na.rm = TRUE)
+
+p95_conc <- quantile(basket_data$price_concentration, 0.95, na.rm = TRUE)
+p5_co <- quantile(basket_data$co_occurrence_score, 0.05, na.rm = TRUE)
+
+# 8. Rule-based risk score
+basket_risk <- basket_data %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+
+    unusually_cheap_for_size = price_residual < p5_resid,
+    unusually_expensive_for_size = price_residual > p95_resid,
+
+    high_price_concentration = price_concentration > p95_conc,
+    unusual_department_combination = co_occurrence_score < p5_co,
+
+    risk_score =
+      as.integer(fast_scan) +
+      as.integer(slow_scan) +
+      as.integer(unusually_cheap_for_size) +
+      as.integer(unusually_expensive_for_size) +
+      as.integer(high_price_concentration) +
+      as.integer(unusual_department_combination)
+  ) %>%
+  arrange(desc(risk_score))
+
+table(basket_risk$risk_score)
+
+top_risky <- basket_risk %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    time_deviation,
+    price_deviation,
+    price_concentration,
+    co_occurrence_score,
+    risk_score
+  ) %>%
+  arrange(desc(risk_score)) %>%
+  head(20)
+
+View(top_risky)
+
+basket_risk %>%
+  group_by(risk_score) %>%
+  summarise(
+    avg_time = mean(avg_time_per_item, na.rm = TRUE),
+    avg_price = mean(total_price, na.rm = TRUE),
+    avg_items = mean(total_items, na.rm = TRUE)
+  )
+
+ggplot() +
+  geom_point(
+    data = basket_risk %>% filter(risk_score <= 1),
+    aes(avg_time_per_item, total_price),
+    color = "#B0BEC5",
+    alpha = 0.08,
+    size = 1
+  ) +
+  geom_point(
+    data = basket_risk %>% filter(risk_score == 2),
+    aes(avg_time_per_item, total_price),
+    color = "#42A5F5",
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  geom_point(
+    data = basket_risk %>% filter(risk_score == 3),
+    aes(avg_time_per_item, total_price),
+    color = "#8E24AA",
+    alpha = 0.4,
+    size = 2
+  ) +
+  geom_point(
+    data = basket_risk %>% filter(risk_score >= 4),
+    aes(avg_time_per_item, total_price),
+    color = "#D32F2F",
+    size = 3
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "Customer behavior and fraud risk",
+    subtitle = "High-risk transactions clearly deviate from normal patterns",
+    x = "Average time per item (seconds)",
+    y = "Total basket value (€)"
+  ) +
+  geom_vline(xintercept = 150, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# ЧИСТЫЙ IF - case 1
+
+```{r}
+# ISOLATION FOREST ON basket_data
+
+library(isotree)
+
+# 1. Basket-level features for IF
+if_train <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE))
+  )
+
+# 2. Matrix for IF
+X_train_raw <- if_train %>%
+  select(-transaction_id)
+
+X_train <- scale(X_train_raw)
+
+# 3. Fit IF on supermarket basket data
+if_model <- isolation.forest(
+  as.matrix(X_train),
+  ntrees = 300,
+  sample_size = 512,
+  ndim = 1,
+  nthreads = 1
+)
+
+# 4. Get anomaly scores on supermarket
+if_train$if_score <- predict(
+  if_model,
+  as.matrix(X_train),
+  type = "score"
+)
+
+# 5. Since known fraud rate is about 15%, flag top 15%
+if_threshold <- quantile(if_train$if_score, 0.85, na.rm = TRUE)
+
+if_train <- if_train %>%
+  mutate(
+    if_flag = if_score >= if_threshold
+  ) %>%
+  arrange(desc(if_score))
+
+table(if_train$if_flag)
+
+# Top suspicious supermarket transactions according to IF
+top_if_train <- if_train %>%
+  arrange(desc(if_score)) %>%
+  slice_head(n = 150)
+
+View(top_if_train)
+
+write.csv(
+  top_if_train,
+  "~/Desktop/supermarket case/case1 just IF/top_if_train.csv",
+  row.names = FALSE
+)
+
+
+top_if_train %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    if_score
+  ) %>%
+  head(20)
+```
+
+```{r}
+ggplot(if_train, aes(x = avg_time_per_item, y = total_price, color = if_flag)) +
+  geom_point(alpha = 0.25, size = 1.2) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_manual(values = c("FALSE" = "grey70", "TRUE" = "#D32F2F")) +
+  labs(
+    title = "Isolation Forest anomalies on supermarket",
+    subtitle = "Top 15% anomaly scores are flagged",
+    x = "Average time per item (seconds)",
+    y = "Total basket value (€)",
+    color = "IF anomaly"
+  ) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# APPLY IF test case1
+
+```{r}
+lines <- readLines("~/Desktop/case1.csv", warn = FALSE)
+
+case1_raw <- tibble(
+  row_id = 1:length(lines),
+  raw_line = lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case1_long <- case1_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+case1_basket <- case1_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+if_case1 <- case1_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(if_train$sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(if_train$price_per_second, na.rm = TRUE))
+  )
+
+X_case1_raw <- if_case1 %>%
+  select(-transaction_id)
+
+X_case1 <- scale(
+  X_case1_raw,
+  center = attr(X_train, "scaled:center"),
+  scale = attr(X_train, "scaled:scale")
+)
+
+if_case1$if_score <- predict(
+  if_model,
+  as.matrix(X_case1),
+  type = "score"
+)
+
+if_case1 <- if_case1 %>%
+  mutate(
+    if_flag = if_score >= if_threshold
+  ) %>%
+  arrange(desc(if_score))
+
+top_150_if_case1 <- if_case1 %>%
+  arrange(desc(if_score)) %>%
+  slice_head(n = 150)
+
+writeLines(as.character(top_150_if_case1$transaction_id))
+
+readr::write_csv(
+  top_150_if_case1,
+  "~/Desktop/supermarket case/test cases/top_150_if_case1.csv"
+)
+```
+
+# CASE 2: baseline based on supermarket + IF based on supermarket
+
+```{r}
+# ==========================================
+# COMBINED MODEL ON SUPERMARKET ONLY
+# baseline on basket_data + IF on basket_data
+# weights: 0.6 baseline / 0.4 IF
+# ==========================================
+
+library(tidyverse)
+library(isotree)
+library(readr)
+
+# ------------------------------------------
+# 1. TRAIN DATA: supermarket
+# ------------------------------------------
+
+train_lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+train_raw <- tibble(
+  transaction_id = 1:length(train_lines),
+  basket = train_lines
+)
+
+train_long <- train_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+# ------------------------------------------
+# 2. basket_data
+# ------------------------------------------
+
+basket_data <- train_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    price_per_second = ifelse(sum(time, na.rm = TRUE) > 0, sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE), NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- train_long %>%
+  count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    department_diversity_ratio = unique_departments / total_items,
+    items_per_second = ifelse(total_time > 0, total_items / total_time, NA_real_)
+  )
+
+# ------------------------------------------
+# 3. Models for deviations
+# ------------------------------------------
+
+model_time <- lm(avg_time_per_item ~ total_items, data = basket_data)
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = basket_data),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items,
+    price_residual = residuals(model_price),
+    price_concentration = max_price / total_price
+  )
+
+# ------------------------------------------
+# 4. Co-occurrence score
+# ------------------------------------------
+
+dept_data <- train_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+pairs <- dept_data %>%
+  inner_join(dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y) %>%
+  rename(
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+co_occurrence <- pairs %>%
+  count(dept_1, dept_2, sort = TRUE) %>%
+  mutate(score = n / max(n))
+
+pairs_scored <- pairs %>%
+  left_join(co_occurrence, by = c("dept_1", "dept_2"))
+
+co_score <- pairs_scored %>%
+  group_by(transaction_id) %>%
+  summarise(
+    co_occurrence_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(co_score, by = "transaction_id") %>%
+  mutate(
+    co_occurrence_score = replace_na(co_occurrence_score, 0)
+  )
+
+# ------------------------------------------
+# 5. Baseline thresholds
+# ------------------------------------------
+
+p5_time  <- quantile(basket_data$avg_time_per_item, 0.05, na.rm = TRUE)
+p95_time <- quantile(basket_data$avg_time_per_item, 0.95, na.rm = TRUE)
+
+p5_price  <- quantile(basket_data$total_price, 0.05, na.rm = TRUE)
+p95_price <- quantile(basket_data$total_price, 0.95, na.rm = TRUE)
+
+p5_resid  <- quantile(basket_data$price_residual, 0.05, na.rm = TRUE)
+p95_resid <- quantile(basket_data$price_residual, 0.95, na.rm = TRUE)
+
+p95_conc <- quantile(basket_data$price_concentration, 0.95, na.rm = TRUE)
+p5_co <- quantile(basket_data$co_occurrence_score, 0.05, na.rm = TRUE)
+
+# ------------------------------------------
+# 6. Baseline score on supermarket
+# ------------------------------------------
+
+basket_train <- basket_data %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+    low_total_price = total_price < p5_price,
+    high_total_price = total_price > p95_price,
+    unusually_cheap_for_size = price_deviation < p5_resid,
+    unusually_expensive_for_size = price_deviation > p95_resid,
+    high_price_concentration = price_concentration > p95_conc,
+    unusual_department_combination = co_occurrence_score < p5_co,
+
+    risk_score =
+      as.integer(fast_scan) +
+      as.integer(slow_scan) +
+      as.integer(low_total_price) +
+      as.integer(high_total_price) +
+      as.integer(unusually_cheap_for_size) +
+      as.integer(unusually_expensive_for_size) +
+      as.integer(high_price_concentration) +
+      as.integer(unusual_department_combination),
+
+    final_score =
+      risk_score * 2 +
+      as.numeric(scale(total_price)) +
+      as.numeric(scale(abs(price_deviation))) +
+      as.numeric(scale(abs(time_deviation))) * 0.5
+  )
+
+# ------------------------------------------
+# 7. IF on supermarket
+# ------------------------------------------
+
+if_train <- basket_train %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE))
+  )
+
+X_train_raw <- if_train %>%
+  select(-transaction_id)
+
+X_train <- scale(X_train_raw)
+
+if_model <- isolation.forest(
+  as.matrix(X_train),
+  ntrees = 300,
+  sample_size = 512,
+  ndim = 1,
+  nthreads = 1
+)
+
+if_train$if_score <- predict(
+  if_model,
+  as.matrix(X_train),
+  type = "score"
+)
+
+# ------------------------------------------
+# 8. Merge baseline + IF on supermarket
+# ------------------------------------------
+
+basket_train <- basket_train %>%
+  left_join(
+    if_train %>% select(transaction_id, if_score),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    baseline_score_01 = percent_rank(final_score),
+    if_score_01 = percent_rank(if_score),
+    combined_score = 0.6 * baseline_score_01 + 0.4 * if_score_01
+  ) %>%
+  arrange(desc(combined_score))
+
+# ------------------------------------------
+# 9. Inspect top 150 on supermarket
+# ------------------------------------------
+
+top_150_combined_train <- basket_train %>%
+  slice_head(n = 150)
+
+write_csv(
+  top_150_combined_train,
+  "~/Desktop/supermarket case/top_150_combined_train.csv"
+)
+
+top_150_combined_train %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    price_deviation,
+    time_deviation,
+    price_concentration,
+    co_occurrence_score,
+    risk_score,
+    final_score,
+    if_score,
+    combined_score
+  ) %>%
+  head(20)
+
+```
+
+# TEST COMBINED MODEL ON CASE 2:
+
+```{r}
+# ==========================================
+# CASE2: COMBINED MODEL
+# baseline + IF
+# weights: 0.6 baseline / 0.4 IF
+# ==========================================
+
+case2_lines <- readLines("~/Desktop/case2.csv", warn = FALSE)
+
+case2_raw <- tibble(
+  row_id = 1:length(case2_lines),
+  raw_line = case2_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case2_long <- case2_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+# ------------------------------------------
+# Basket-level features
+# ------------------------------------------
+
+case2_basket <- case2_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+# ------------------------------------------
+# Department concentration / structure
+# ------------------------------------------
+
+case2_dept_share <- case2_long %>%
+  count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+case2_basket <- case2_basket %>%
+  left_join(case2_dept_share, by = "transaction_id") %>%
+  mutate(
+    department_diversity_ratio = unique_departments / total_items,
+    items_per_second = ifelse(total_time > 0, total_items / total_time, NA_real_)
+  )
+
+# ------------------------------------------
+# Co-occurrence score using supermarket train graph
+# ------------------------------------------
+
+case2_dept_data <- case2_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+case2_pairs <- case2_dept_data %>%
+  inner_join(case2_dept_data, by = "transaction_id") %>%
+  filter(department_name.x < department_name.y) %>%
+  rename(
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+case2_co_score <- case2_pairs %>%
+  left_join(
+    co_occurrence %>% select(dept_1, dept_2, score),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    co_occurrence_score = mean(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+case2_basket <- case2_basket %>%
+  left_join(case2_co_score, by = "transaction_id") %>%
+  mutate(
+    co_occurrence_score = replace_na(co_occurrence_score, 0),
+
+    expected_time_given_size = predict(model_time, newdata = .),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items,
+
+    price_concentration = max_price / total_price
+  )
+
+# ------------------------------------------
+# BASELINE SCORE ON CASE2
+# ------------------------------------------
+
+case2_basket <- case2_basket %>%
+  mutate(
+    fast_scan = avg_time_per_item < p5_time,
+    slow_scan = avg_time_per_item > p95_time,
+
+    low_total_price = total_price < p5_price,
+    high_total_price = total_price > p95_price,
+
+    unusually_cheap_for_size = price_deviation < p5_resid,
+    unusually_expensive_for_size = price_deviation > p95_resid,
+
+    high_price_concentration = price_concentration > p95_conc,
+    unusual_department_combination = co_occurrence_score < p5_co,
+
+    risk_score =
+      as.integer(fast_scan) +
+      as.integer(slow_scan) +
+      as.integer(low_total_price) +
+      as.integer(high_total_price) +
+      as.integer(unusually_cheap_for_size) +
+      as.integer(unusually_expensive_for_size) +
+      as.integer(high_price_concentration) +
+      as.integer(unusual_department_combination),
+
+    final_score =
+      risk_score * 2 +
+      as.numeric(scale(total_price)) +
+      as.numeric(scale(abs(price_deviation))) +
+      as.numeric(scale(abs(time_deviation))) * 0.5
+  )
+
+# ------------------------------------------
+# IF SCORE ON CASE2
+# same feature set as current clean IF
+# ------------------------------------------
+
+if_case2 <- case2_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(if_train$sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(if_train$price_per_second, na.rm = TRUE))
+  )
+
+X_case2_raw <- if_case2 %>%
+  select(-transaction_id)
+
+X_case2 <- scale(
+  X_case2_raw,
+  center = attr(X_train, "scaled:center"),
+  scale = attr(X_train, "scaled:scale")
+)
+
+if_case2$if_score <- predict(
+  if_model,
+  as.matrix(X_case2),
+  type = "score"
+)
+
+if_case2 <- if_case2 %>%
+  arrange(desc(if_score))
+
+# ------------------------------------------
+# COMBINED SCORE
+# ------------------------------------------
+
+case2_basket <- case2_basket %>%
+  left_join(
+    if_case2 %>% select(transaction_id, if_score),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    baseline_score_01 = percent_rank(final_score),
+    if_score_01 = percent_rank(if_score),
+    combined_score = 0.6 * baseline_score_01 + 0.4 * if_score_01
+  ) %>%
+  arrange(desc(combined_score))
+
+top_150_combined_case2 <- case2_basket %>%
+  slice_head(n = 150)
+
+# Submission list
+writeLines(as.character(top_150_combined_case2$transaction_id))
+
+readr::write_csv(
+  top_150_combined_case2,
+  "~/Desktop/supermarket case/test cases/top_150_combined_case2.csv"
+)
+
+```
+
+# ДОПОЛНИТЕЛЬНО МОЖНО ПОПРОБОВАТЬ ИЗМЕНИТЬ!!!!!!!!!
+
+# 1. ДОБАВИЛИ НОВЫЕ ПЕРЕМЕННЫЕ В ЧИСТЫЙ IF
+
+```{r}
+# 1. Basket-level features for IF
+if_train <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    items_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    department_diversity_ratio,
+    dominant_department_share,
+    price_deviation,
+    time_deviation
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    items_per_second = replace_na(items_per_second, median(items_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    department_diversity_ratio = replace_na(department_diversity_ratio, median(department_diversity_ratio, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(dominant_department_share, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE)),
+    time_deviation = replace_na(time_deviation, median(time_deviation, na.rm = TRUE))
+  )
+
+# 2. Matrix for IF
+X_train_raw <- if_train %>%
+  select(-transaction_id)
+
+X_train <- scale(X_train_raw)
+
+# 3. Fit IF on supermarket basket data
+if_model <- isolation.forest(
+  as.matrix(X_train),
+  ntrees = 300,
+  sample_size = 512,
+  ndim = 1,
+  nthreads = 1
+)
+
+# 4. Get anomaly scores on supermarket
+if_train$if_score <- predict(
+  if_model,
+  as.matrix(X_train),
+  type = "score"
+)
+
+# 5. Since known fraud rate is about 15%, flag top 15%
+if_threshold <- quantile(if_train$if_score, 0.85, na.rm = TRUE)
+
+if_train <- if_train %>%
+  mutate(
+    if_flag = if_score >= if_threshold
+  ) %>%
+  arrange(desc(if_score))
+
+table(if_train$if_flag)
+
+# Top suspicious supermarket transactions according to IF
+top_if_train <- if_train %>%
+  arrange(desc(if_score)) %>%
+  slice_head(n = 150)
+
+View(top_if_train)
+
+write.csv(
+  top_if_train,
+  "~/Desktop/supermarket case/case2 just IF/top_if_train.csv",
+  row.names = FALSE
+)
+
+top_if_train %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    items_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    department_diversity_ratio,
+    dominant_department_share,
+    price_deviation,
+    time_deviation,
+    if_score
+  ) %>%
+  head(20)
+```
+
+# 2. IF ПОСТРОЕННЫЙ НА RISKY BASKET DATA
+
+```{r}
+
+# ISOLATION FOREST ON TRAIN DATA
+
+# Выбираем только числовые признаки, которые отражают разные стороны корзины
+if_train <- basket_risk %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    unique_departments,
+    price_deviation,
+    time_deviation,
+    price_concentration,
+    co_occurrence_score
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE))
+  )
+
+# Матрица для IF
+X_train <- if_train %>%
+  select(-transaction_id) %>%
+  scale()
+
+# Модель IF
+if_model <- isolation.forest(
+  as.matrix(X_train),
+  ntrees = 300,
+  sample_size = 512,
+  ndim = 1,
+  nthreads = 1
+)
+
+# Score на train
+basket_risk$if_score <- predict(
+  if_model,
+  as.matrix(X_train),
+  type = "score"
+)
+
+# Так как мы знаем, что fraud около 15%, берем top 15%
+if_threshold <- quantile(basket_risk$if_score, 0.85, na.rm = TRUE)
+
+basket_risk <- basket_risk %>%
+  mutate(
+    if_flag = if_score >= if_threshold
+  ) %>%
+  arrange(desc(if_score))
+
+table(basket_risk$if_flag)
+
+top_if_train <- basket_risk %>%
+  arrange(desc(if_score)) %>%
+  slice_head(n = 150)
+
+View(top_if_train %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    price_deviation,
+    time_deviation,
+    price_concentration,
+    co_occurrence_score,
+    risk_score,
+    if_score
+  ))
+```
+
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
