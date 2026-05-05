@@ -1,0 +1,617 @@
+---
+title: "Untitled"
+output: pdf_document
+date: "2026-05-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+
+# LOAD SUPERMARKET
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+# LOAD SHRINKAGE
+
+shrinkage <- read.csv(
+  "~/Desktop/supermarket case/shrinkage.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    items_expected = as.numeric(items_expected),
+    revenue_expected = as.numeric(revenue_expected),
+    items_registered = as.numeric(items_registered),
+    revenue_registered = as.numeric(revenue_registered),
+    items_lost = as.numeric(items_lost),
+    revenue_lost = as.numeric(revenue_lost)
+  ) %>%
+  mutate(
+    item_loss_rate = items_lost / items_expected,
+    revenue_loss_rate = revenue_lost / revenue_expected
+  )
+
+# optional combined department risk
+shrinkage <- shrinkage %>%
+  mutate(
+    dept_shrinkage_score =
+      0.5 * percent_rank(item_loss_rate) +
+      0.5 * percent_rank(revenue_loss_rate)
+  )
+
+# ITEM-LEVEL SHRINKAGE ATTACHMENT
+
+long_shrinkage <- long_data %>%
+  left_join(
+    shrinkage %>%
+      select(
+        department,
+        item_loss_rate,
+        revenue_loss_rate,
+        dept_shrinkage_score
+      ),
+    by = "department"
+  )
+
+# BASKET-LEVEL SHRINKAGE FEATURES
+
+basket_shrinkage <- long_shrinkage %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+
+    avg_item_loss_rate = mean(item_loss_rate, na.rm = TRUE),
+    avg_revenue_loss_rate = mean(revenue_loss_rate, na.rm = TRUE),
+    max_item_loss_rate = max(item_loss_rate, na.rm = TRUE),
+    max_revenue_loss_rate = max(revenue_loss_rate, na.rm = TRUE),
+
+    avg_dept_shrinkage_score = mean(dept_shrinkage_score, na.rm = TRUE),
+    max_dept_shrinkage_score = max(dept_shrinkage_score, na.rm = TRUE),
+
+    value_weighted_shrinkage =
+      sum(price * dept_shrinkage_score, na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    high_shrinkage_item_share =
+      mean(dept_shrinkage_score >= quantile(shrinkage$dept_shrinkage_score, 0.75, na.rm = TRUE), na.rm = TRUE),
+
+    high_shrinkage_value_share =
+      sum(ifelse(
+        dept_shrinkage_score >= quantile(shrinkage$dept_shrinkage_score, 0.75, na.rm = TRUE),
+        price,
+        0
+      ), na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, 0)
+  )
+
+# FINAL SHRINKAGE SCORE
+
+basket_shrinkage <- basket_shrinkage %>%
+  mutate(
+    shrinkage_score =
+      0.15 * percent_rank(total_price) +
+      0.15 * percent_rank(avg_price) +
+      0.15 * percent_rank(avg_item_loss_rate) +
+      0.15 * percent_rank(avg_revenue_loss_rate) +
+      0.10 * percent_rank(max_item_loss_rate) +
+      0.10 * percent_rank(max_revenue_loss_rate) +
+      0.10 * percent_rank(value_weighted_shrinkage) +
+      0.05 * percent_rank(high_shrinkage_item_share) +
+      0.05 * percent_rank(high_shrinkage_value_share)
+  ) %>%
+  arrange(desc(shrinkage_score))
+
+top_150_shrinkage_train <- basket_shrinkage %>%
+  slice_head(n = 150)
+
+summary(top_150_shrinkage_train$total_items)
+summary(top_150_shrinkage_train$total_price)
+summary(top_150_shrinkage_train$avg_dept_shrinkage_score)
+summary(top_150_shrinkage_train$shrinkage_score)
+
+write.csv(
+  top_150_shrinkage_train,
+  "~/Desktop/top_150_shrinkage_train.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# CASE18: PURE SHRINKAGE-INFORMED SCORE
+
+case18_lines <- readLines("~/Desktop/case18.csv", warn = FALSE)
+
+case18_raw <- tibble(
+  raw_line = case18_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case18_long <- case18_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+case18_long_shrinkage <- case18_long %>%
+  left_join(
+    shrinkage %>%
+      select(
+        department,
+        item_loss_rate,
+        revenue_loss_rate,
+        dept_shrinkage_score
+      ),
+    by = "department"
+  )
+
+case18_shrinkage <- case18_long_shrinkage %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+
+    avg_item_loss_rate = mean(item_loss_rate, na.rm = TRUE),
+    avg_revenue_loss_rate = mean(revenue_loss_rate, na.rm = TRUE),
+    max_item_loss_rate = max(item_loss_rate, na.rm = TRUE),
+    max_revenue_loss_rate = max(revenue_loss_rate, na.rm = TRUE),
+
+    avg_dept_shrinkage_score = mean(dept_shrinkage_score, na.rm = TRUE),
+    max_dept_shrinkage_score = max(dept_shrinkage_score, na.rm = TRUE),
+
+    value_weighted_shrinkage =
+      sum(price * dept_shrinkage_score, na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    high_shrinkage_item_share =
+      mean(dept_shrinkage_score >= quantile(shrinkage$dept_shrinkage_score, 0.75, na.rm = TRUE), na.rm = TRUE),
+
+    high_shrinkage_value_share =
+      sum(ifelse(
+        dept_shrinkage_score >= quantile(shrinkage$dept_shrinkage_score, 0.75, na.rm = TRUE),
+        price,
+        0
+      ), na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, 0)
+  ) %>%
+  mutate(
+    shrinkage_score =
+      0.15 * percent_rank(total_price) +
+      0.15 * percent_rank(avg_price) +
+      0.15 * percent_rank(avg_item_loss_rate) +
+      0.15 * percent_rank(avg_revenue_loss_rate) +
+      0.10 * percent_rank(max_item_loss_rate) +
+      0.10 * percent_rank(max_revenue_loss_rate) +
+      0.10 * percent_rank(value_weighted_shrinkage) +
+      0.05 * percent_rank(high_shrinkage_item_share) +
+      0.05 * percent_rank(high_shrinkage_value_share)
+  ) %>%
+  arrange(desc(shrinkage_score))
+
+top_150_shrinkage_case18 <- case18_shrinkage %>%
+  slice_head(n = 150)
+
+summary(top_150_shrinkage_case18$total_items)
+summary(top_150_shrinkage_case18$total_price)
+summary(top_150_shrinkage_case18$avg_dept_shrinkage_score)
+summary(top_150_shrinkage_case18$shrinkage_score)
+
+writeLines(as.character(top_150_shrinkage_case18$transaction_id))
+
+write.csv(
+  top_150_shrinkage_case18,
+  "~/Desktop/top_150_shrinkage_case18.csv",
+  row.names = FALSE
+)
+```
+#CASE 19
+
+# TRAIN: stocktake-informed score on supermarket
+
+```{r}
+library(tidyverse)
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+# LOAD STOCKTAKE MISSING
+
+stocktake <- read.csv(
+  "~/Desktop/supermarket case/stocktake_missing.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    item_value = as.numeric(item_value)
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(item_value),
+    item_value >= 0
+  )
+
+# DEPARTMENT-LEVEL STOCKTAKE PROFILE
+
+stocktake_profile <- stocktake %>%
+  group_by(department) %>%
+  summarise(
+    missing_count = n(),
+    missing_mean_value = mean(item_value, na.rm = TRUE),
+    missing_median_value = median(item_value, na.rm = TRUE),
+    missing_sd_value = sd(item_value, na.rm = TRUE),
+    missing_p75_value = quantile(item_value, 0.75, na.rm = TRUE),
+    missing_p90_value = quantile(item_value, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    missing_sd_value = replace_na(missing_sd_value, 0),
+    dept_missing_score =
+      0.5 * percent_rank(missing_count) +
+      0.5 * percent_rank(missing_mean_value)
+  )
+
+# ITEM-LEVEL ATTACHMENT
+
+long_stock <- long_data %>%
+  left_join(stocktake_profile, by = "department") %>%
+  mutate(
+    missing_count = replace_na(missing_count, 0),
+    missing_mean_value = replace_na(missing_mean_value, median(stocktake_profile$missing_mean_value, na.rm = TRUE)),
+    missing_median_value = replace_na(missing_median_value, median(stocktake_profile$missing_median_value, na.rm = TRUE)),
+    missing_sd_value = replace_na(missing_sd_value, median(stocktake_profile$missing_sd_value, na.rm = TRUE)),
+    missing_p75_value = replace_na(missing_p75_value, median(stocktake_profile$missing_p75_value, na.rm = TRUE)),
+    missing_p90_value = replace_na(missing_p90_value, median(stocktake_profile$missing_p90_value, na.rm = TRUE)),
+    dept_missing_score = replace_na(dept_missing_score, 0)
+  ) %>%
+  mutate(
+    value_gap_to_missing_median = abs(price - missing_median_value),
+    value_gap_to_missing_mean = abs(price - missing_mean_value),
+    within_missing_p75 = price <= missing_p75_value,
+    within_missing_p90 = price <= missing_p90_value
+  )
+
+# BASKET-LEVEL STOCKTAKE FEATURES
+
+basket_stocktake <- long_stock %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+
+    avg_missing_count = mean(missing_count, na.rm = TRUE),
+    avg_missing_mean_value = mean(missing_mean_value, na.rm = TRUE),
+    avg_missing_median_value = mean(missing_median_value, na.rm = TRUE),
+
+    avg_dept_missing_score = mean(dept_missing_score, na.rm = TRUE),
+    max_dept_missing_score = max(dept_missing_score, na.rm = TRUE),
+
+    value_weighted_missing_score =
+      sum(price * dept_missing_score, na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    avg_value_gap_to_missing_median = mean(value_gap_to_missing_median, na.rm = TRUE),
+    avg_value_gap_to_missing_mean = mean(value_gap_to_missing_mean, na.rm = TRUE),
+
+    share_items_within_missing_p75 = mean(within_missing_p75, na.rm = TRUE),
+    share_items_within_missing_p90 = mean(within_missing_p90, na.rm = TRUE),
+
+    high_missing_dept_item_share =
+      mean(dept_missing_score >= quantile(stocktake_profile$dept_missing_score, 0.75, na.rm = TRUE), na.rm = TRUE),
+
+    high_missing_dept_value_share =
+      sum(ifelse(
+        dept_missing_score >= quantile(stocktake_profile$dept_missing_score, 0.75, na.rm = TRUE),
+        price,
+        0
+      ), na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    high_missing_dept_value_share = replace_na(high_missing_dept_value_share, 0)
+  )
+
+# FINAL STOCKTAKE SCORE
+
+basket_stocktake <- basket_stocktake %>%
+  mutate(
+    stocktake_score =
+      0.15 * percent_rank(total_price) +
+      0.10 * percent_rank(avg_price) +
+      0.15 * percent_rank(avg_dept_missing_score) +
+      0.10 * percent_rank(max_dept_missing_score) +
+      0.15 * percent_rank(value_weighted_missing_score) +
+      0.10 * percent_rank(share_items_within_missing_p75) +
+      0.10 * percent_rank(share_items_within_missing_p90) +
+      0.10 * percent_rank(high_missing_dept_item_share) +
+      0.05 * percent_rank(high_missing_dept_value_share)
+  ) %>%
+  arrange(desc(stocktake_score))
+
+top_150_stocktake_train <- basket_stocktake %>%
+  slice_head(n = 150)
+
+summary(top_150_stocktake_train$total_items)
+summary(top_150_stocktake_train$total_price)
+summary(top_150_stocktake_train$avg_dept_missing_score)
+summary(top_150_stocktake_train$stocktake_score)
+
+write.csv(
+  top_150_stocktake_train,
+  "~/Desktop/top_150_stocktake_train.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+# CASE19: PURE STOCKTAKE-INFORMED SCORE
+
+case19_lines <- readLines("~/Desktop/case19.csv", warn = FALSE)
+
+case19_raw <- tibble(
+  raw_line = case19_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case19_long <- case19_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    time >= 0,
+    price >= 0
+  )
+
+case19_long_stock <- case19_long %>%
+  left_join(stocktake_profile, by = "department") %>%
+  mutate(
+    missing_count = replace_na(missing_count, 0),
+    missing_mean_value = replace_na(missing_mean_value, median(stocktake_profile$missing_mean_value, na.rm = TRUE)),
+    missing_median_value = replace_na(missing_median_value, median(stocktake_profile$missing_median_value, na.rm = TRUE)),
+    missing_sd_value = replace_na(missing_sd_value, median(stocktake_profile$missing_sd_value, na.rm = TRUE)),
+    missing_p75_value = replace_na(missing_p75_value, median(stocktake_profile$missing_p75_value, na.rm = TRUE)),
+    missing_p90_value = replace_na(missing_p90_value, median(stocktake_profile$missing_p90_value, na.rm = TRUE)),
+    dept_missing_score = replace_na(dept_missing_score, 0)
+  ) %>%
+  mutate(
+    value_gap_to_missing_median = abs(price - missing_median_value),
+    value_gap_to_missing_mean = abs(price - missing_mean_value),
+    within_missing_p75 = price <= missing_p75_value,
+    within_missing_p90 = price <= missing_p90_value
+  )
+
+case19_stocktake <- case19_long_stock %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+
+    avg_missing_count = mean(missing_count, na.rm = TRUE),
+    avg_missing_mean_value = mean(missing_mean_value, na.rm = TRUE),
+    avg_missing_median_value = mean(missing_median_value, na.rm = TRUE),
+
+    avg_dept_missing_score = mean(dept_missing_score, na.rm = TRUE),
+    max_dept_missing_score = max(dept_missing_score, na.rm = TRUE),
+
+    value_weighted_missing_score =
+      sum(price * dept_missing_score, na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    avg_value_gap_to_missing_median = mean(value_gap_to_missing_median, na.rm = TRUE),
+    avg_value_gap_to_missing_mean = mean(value_gap_to_missing_mean, na.rm = TRUE),
+
+    share_items_within_missing_p75 = mean(within_missing_p75, na.rm = TRUE),
+    share_items_within_missing_p90 = mean(within_missing_p90, na.rm = TRUE),
+
+    high_missing_dept_item_share =
+      mean(dept_missing_score >= quantile(stocktake_profile$dept_missing_score, 0.75, na.rm = TRUE), na.rm = TRUE),
+
+    high_missing_dept_value_share =
+      sum(ifelse(
+        dept_missing_score >= quantile(stocktake_profile$dept_missing_score, 0.75, na.rm = TRUE),
+        price,
+        0
+      ), na.rm = TRUE) / sum(price, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    high_missing_dept_value_share = replace_na(high_missing_dept_value_share, 0)
+  ) %>%
+  mutate(
+    stocktake_score =
+      0.15 * percent_rank(total_price) +
+      0.10 * percent_rank(avg_price) +
+      0.15 * percent_rank(avg_dept_missing_score) +
+      0.10 * percent_rank(max_dept_missing_score) +
+      0.15 * percent_rank(value_weighted_missing_score) +
+      0.10 * percent_rank(share_items_within_missing_p75) +
+      0.10 * percent_rank(share_items_within_missing_p90) +
+      0.10 * percent_rank(high_missing_dept_item_share) +
+      0.05 * percent_rank(high_missing_dept_value_share)
+  ) %>%
+  arrange(desc(stocktake_score))
+
+top_150_stocktake_case19 <- case19_stocktake %>%
+  slice_head(n = 150)
+
+summary(top_150_stocktake_case19$total_items)
+summary(top_150_stocktake_case19$total_price)
+summary(top_150_stocktake_case19$avg_dept_missing_score)
+summary(top_150_stocktake_case19$stocktake_score)
+
+writeLines(as.character(top_150_stocktake_case19$transaction_id))
+
+write.csv(
+  top_150_stocktake_case19,
+  "~/Desktop/top_150_stocktake_case19.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+
+```
+
+

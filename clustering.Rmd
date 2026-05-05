@@ -1,0 +1,1046 @@
+---
+title: "clastering"
+output: pdf_document
+date: "2026-05-03"
+---
+
+# CASE 13
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# TRAIN
+
+```{r}
+library(tidyverse)
+
+# K-MEANS + DISTANCE-TO-CENTROID ON SUPERMARKET
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  )
+
+long_data_clean <- long_data %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+slow_threshold <- quantile(long_data_clean$time, 0.95, na.rm = TRUE)
+
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    range_time = max(time, na.rm = TRUE) - min(time, na.rm = TRUE),
+    cv_time = ifelse(mean(time, na.rm = TRUE) > 0,
+                     sd(time, na.rm = TRUE) / mean(time, na.rm = TRUE),
+                     NA_real_),
+    price_per_second = ifelse(sum(time, na.rm = TRUE) > 0,
+                              sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+                              NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    long_pause_count = sum(time > slow_threshold, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- long_data_clean %>%
+  count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    department_diversity_ratio = unique_departments / total_items,
+    items_per_second = ifelse(total_time > 0, total_items / total_time, NA_real_),
+    items_per_department = total_items / unique_departments
+  )
+
+model_time <- lm(avg_time_per_item ~ total_items, data = basket_data)
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = basket_data),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+# FEATURES FOR K-MEANS
+
+kmeans_train <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    range_time,
+    cv_time,
+    price_per_second,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    department_diversity_ratio,
+    items_per_second,
+    items_per_department,
+    time_deviation,
+    price_deviation,
+    long_pause_count
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    range_time = replace_na(range_time, median(range_time, na.rm = TRUE)),
+    cv_time = replace_na(cv_time, median(cv_time, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    sd_price = replace_na(sd_price, median(sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(dominant_department_share, na.rm = TRUE)),
+    department_diversity_ratio = replace_na(department_diversity_ratio, median(department_diversity_ratio, na.rm = TRUE)),
+    items_per_second = replace_na(items_per_second, median(items_per_second, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(items_per_department, na.rm = TRUE)),
+    time_deviation = replace_na(time_deviation, median(time_deviation, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE)),
+    long_pause_count = replace_na(long_pause_count, 0)
+  )
+
+X_kmeans_raw <- kmeans_train %>%
+  select(-transaction_id)
+
+X_kmeans <- scale(X_kmeans_raw)
+
+# FIT K-MEANS
+
+set.seed(123)
+k <- 8
+
+kmeans_model <- kmeans(
+  X_kmeans,
+  centers = k,
+  nstart = 20,
+  iter.max = 100
+)
+
+# cluster assignment
+kmeans_train$cluster_id <- kmeans_model$cluster
+
+# distance to assigned centroid
+centers <- kmeans_model$centers
+
+assigned_distances <- map2_dbl(
+  split(as.data.frame(X_kmeans), seq_len(nrow(X_kmeans))),
+  kmeans_model$cluster,
+  ~ {
+    row_vec <- as.numeric(.x[1, ])
+    center_vec <- centers[.y, ]
+    sqrt(sum((row_vec - center_vec)^2))
+  }
+)
+
+kmeans_train$distance_to_centroid <- assigned_distances
+
+# optional: cluster sizes
+cluster_sizes <- table(kmeans_model$cluster)
+
+kmeans_train <- kmeans_train %>%
+  mutate(
+    cluster_size = as.numeric(cluster_sizes[as.character(cluster_id)])
+  )
+
+# FINAL OUTPUT ON SUPERMARKET
+
+basket_kmeans <- basket_data %>%
+  left_join(
+    kmeans_train %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    distance_to_centroid_01 = percent_rank(distance_to_centroid)
+  ) %>%
+  arrange(desc(distance_to_centroid))
+
+top_150_kmeans_distance_train <- basket_kmeans %>%
+  slice_head(n = 150)
+
+summary(top_150_kmeans_distance_train$total_items)
+summary(top_150_kmeans_distance_train$total_price)
+summary(top_150_kmeans_distance_train$avg_time_per_item)
+summary(top_150_kmeans_distance_train$distance_to_centroid)
+summary(top_150_kmeans_distance_train$cluster_size)
+
+top_150_kmeans_distance_train %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_time_per_item,
+    unique_departments,
+    cluster_id,
+    cluster_size,
+    distance_to_centroid
+  ) %>%
+  head(20)
+
+write.csv(
+  top_150_kmeans_distance_train,
+  "~/Desktop/top_150_kmeans_distance_train.csv",
+  row.names = FALSE
+)
+```
+
+
+
+```{r}
+summary(top_150_kmeans_distance_train$total_items)
+summary(top_150_kmeans_distance_train$total_price)
+summary(top_150_kmeans_distance_train$avg_time_per_item)
+summary(top_150_kmeans_distance_train$cluster_size)
+```
+# TEST 
+
+```{r}
+
+library(tidyverse)
+
+case13_lines <- readLines("~/Desktop/case13.csv", warn = FALSE)
+
+case13_raw <- tibble(
+  raw_line = case13_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case13_long <- case13_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case13_basket <- case13_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    range_time = max(time, na.rm = TRUE) - min(time, na.rm = TRUE),
+    cv_time = ifelse(mean(time, na.rm = TRUE) > 0,
+                     sd(time, na.rm = TRUE) / mean(time, na.rm = TRUE),
+                     NA_real_),
+    price_per_second = ifelse(sum(time, na.rm = TRUE) > 0,
+                              sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+                              NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    long_pause_count = sum(time > slow_threshold, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+case13_dept_share <- case13_long %>%
+  count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+case13_basket <- case13_basket %>%
+  left_join(case13_dept_share, by = "transaction_id") %>%
+  mutate(
+    department_diversity_ratio = unique_departments / total_items,
+    items_per_second = ifelse(total_time > 0, total_items / total_time, NA_real_),
+    items_per_department = total_items / unique_departments
+  )
+
+case13_basket <- case13_basket %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = .),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+# SAME FEATURES AS TRAIN K-MEANS
+
+kmeans_case13 <- case13_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    range_time,
+    cv_time,
+    price_per_second,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    department_diversity_ratio,
+    items_per_second,
+    items_per_department,
+    time_deviation,
+    price_deviation,
+    long_pause_count
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    range_time = replace_na(range_time, median(range_time, na.rm = TRUE)),
+    cv_time = replace_na(cv_time, median(cv_time, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    sd_price = replace_na(sd_price, median(sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(dominant_department_share, na.rm = TRUE)),
+    department_diversity_ratio = replace_na(department_diversity_ratio, median(department_diversity_ratio, na.rm = TRUE)),
+    items_per_second = replace_na(items_per_second, median(items_per_second, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(items_per_department, na.rm = TRUE)),
+    time_deviation = replace_na(time_deviation, median(time_deviation, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE)),
+    long_pause_count = replace_na(long_pause_count, 0)
+  )
+
+X_case13_raw <- kmeans_case13 %>%
+  select(-transaction_id)
+
+X_case13 <- scale(
+  X_case13_raw,
+  center = attr(X_kmeans, "scaled:center"),
+  scale = attr(X_kmeans, "scaled:scale")
+)
+
+# DISTANCE TO NEAREST CENTROID
+
+centers <- kmeans_model$centers
+
+case13_distances <- apply(X_case13, 1, function(row_vec) {
+  dists <- apply(centers, 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  min(dists)
+})
+
+case13_clusters <- apply(X_case13, 1, function(row_vec) {
+  dists <- apply(centers, 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  which.min(dists)
+})
+
+cluster_sizes <- table(kmeans_model$cluster)
+
+kmeans_case13$cluster_id <- case13_clusters
+kmeans_case13$cluster_size <- as.numeric(cluster_sizes[as.character(case13_clusters)])
+kmeans_case13$distance_to_centroid <- case13_distances
+
+# FINAL PURE K-MEANS DISTANCE OUTPUT
+
+case13_kmeans <- case13_basket %>%
+  left_join(
+    kmeans_case13 %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    distance_to_centroid_01 = percent_rank(distance_to_centroid)
+  ) %>%
+  arrange(desc(distance_to_centroid))
+
+top_150_kmeans_distance_case13 <- case13_kmeans %>%
+  slice_head(n = 150)
+
+summary(top_150_kmeans_distance_case13$total_items)
+summary(top_150_kmeans_distance_case13$total_price)
+summary(top_150_kmeans_distance_case13$avg_time_per_item)
+summary(top_150_kmeans_distance_case13$distance_to_centroid)
+summary(top_150_kmeans_distance_case13$cluster_size)
+
+writeLines(as.character(top_150_kmeans_distance_case13$transaction_id))
+
+write.csv(
+  top_150_kmeans_distance_case13,
+  "~/Desktop/top_150_kmeans_distance_case13.csv",
+  row.names = FALSE
+)
+```
+
+# IF + CLASTERING TRAIN 
+
+```{r}
+library(tidyverse)
+library(isotree)
+
+# TRAIN DATA
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  )
+
+long_data_clean <- long_data %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+slow_threshold <- quantile(long_data_clean$time, 0.95, na.rm = TRUE)
+
+# BASKET DATA
+
+basket_data <- long_data_clean %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    range_time = max(time, na.rm = TRUE) - min(time, na.rm = TRUE),
+    cv_time = ifelse(mean(time, na.rm = TRUE) > 0,
+                     sd(time, na.rm = TRUE) / mean(time, na.rm = TRUE),
+                     NA_real_),
+    price_per_second = ifelse(sum(time, na.rm = TRUE) > 0,
+                              sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+                              NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    long_pause_count = sum(time > slow_threshold, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- long_data_clean %>%
+  count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    department_diversity_ratio = unique_departments / total_items,
+    items_per_second = ifelse(total_time > 0, total_items / total_time, NA_real_),
+    items_per_department = total_items / unique_departments
+  )
+
+model_time <- lm(avg_time_per_item ~ total_items, data = basket_data)
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_time_given_size = predict(model_time, newdata = basket_data),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+# IF TRAIN
+
+if_train <- basket_data %>%
+  select(
+        transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE))
+  )
+
+X_train_raw <- if_train %>%
+  select(-transaction_id)
+
+X_train <- scale(X_train_raw)
+
+if_model <- isolation.forest(
+  as.matrix(X_train),
+  ntrees = 300,
+  sample_size = 512,
+  ndim = 1,
+  nthreads = 1
+)
+
+if_train$if_score <- predict(
+  if_model,
+  as.matrix(X_train),
+  type = "score"
+)
+
+# K-MEANS TRAIN
+
+kmeans_train <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    range_time,
+    cv_time,
+    price_per_second,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    department_diversity_ratio,
+    items_per_second,
+    items_per_department,
+    time_deviation,
+    price_deviation,
+    long_pause_count
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    range_time = replace_na(range_time, median(range_time, na.rm = TRUE)),
+    cv_time = replace_na(cv_time, median(cv_time, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    sd_price = replace_na(sd_price, median(sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(dominant_department_share, na.rm = TRUE)),
+    department_diversity_ratio = replace_na(department_diversity_ratio, median(department_diversity_ratio, na.rm = TRUE)),
+    items_per_second = replace_na(items_per_second, median(items_per_second, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(items_per_department, na.rm = TRUE)),
+    time_deviation = replace_na(time_deviation, median(time_deviation, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE)),
+    long_pause_count = replace_na(long_pause_count, 0)
+  )
+
+X_kmeans_raw <- kmeans_train %>%
+  select(-transaction_id)
+
+X_kmeans <- scale(X_kmeans_raw)
+
+set.seed(123)
+k <- 8
+
+kmeans_model <- kmeans(
+  X_kmeans,
+  centers = k,
+  nstart = 20,
+  iter.max = 100
+)
+
+kmeans_train$cluster_id <- kmeans_model$cluster
+centers <- kmeans_model$centers
+
+assigned_distances <- map2_dbl(
+  split(as.data.frame(X_kmeans), seq_len(nrow(X_kmeans))),
+  kmeans_model$cluster,
+  ~ {
+    row_vec <- as.numeric(.x[1, ])
+    center_vec <- centers[.y, ]
+    sqrt(sum((row_vec - center_vec)^2))
+  }
+)
+
+kmeans_train$distance_to_centroid <- assigned_distances
+
+cluster_sizes <- table(kmeans_model$cluster)
+
+kmeans_train <- kmeans_train %>%
+  mutate(
+    cluster_size = as.numeric(cluster_sizes[as.character(cluster_id)])
+  )
+
+# FINAL TRAIN SCORE
+
+basket_if_kmeans_train <- basket_data %>%
+  left_join(
+    if_train %>% select(transaction_id, if_score),
+    by = "transaction_id"
+  ) %>%
+  left_join(
+    kmeans_train %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    if_score_01 = percent_rank(if_score),
+    distance_to_centroid_01 = percent_rank(distance_to_centroid),
+    combined_ik_score =
+      0.50 * if_score_01 +
+      0.50 * distance_to_centroid_01
+  ) %>%
+  arrange(desc(combined_ik_score))
+
+top_150_if_kmeans_train <- basket_if_kmeans_train %>%
+  slice_head(n = 150)
+
+summary(top_150_if_kmeans_train$if_score)
+summary(top_150_if_kmeans_train$distance_to_centroid)
+summary(top_150_if_kmeans_train$total_items)
+summary(top_150_if_kmeans_train$total_price)
+
+write.csv(
+  top_150_if_kmeans_train,
+  "~/Desktop/top_150_if_kmeans_train.csv",
+  row.names = FALSE
+)
+```
+
+
+# CASE14: IF + K-MEANS DISTANCE TEST
+
+```{r}
+
+case15_lines <- readLines("~/Desktop/case15.csv", warn = FALSE)
+
+case15_raw <- tibble(
+  raw_line = case15_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case15_long <- case15_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case15_basket <- case15_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_time = max(time, na.rm = TRUE),
+    min_time = min(time, na.rm = TRUE),
+    range_time = max(time, na.rm = TRUE) - min(time, na.rm = TRUE),
+    cv_time = ifelse(mean(time, na.rm = TRUE) > 0,
+                     sd(time, na.rm = TRUE) / mean(time, na.rm = TRUE),
+                     NA_real_),
+    price_per_second = ifelse(sum(time, na.rm = TRUE) > 0,
+                              sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+                              NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    min_price = min(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    long_pause_count = sum(time > slow_threshold, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+case15_dept_share <- case15_long %>%
+  count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+case15_basket <- case15_basket %>%
+  left_join(case14_dept_share, by = "transaction_id") %>%
+  mutate(
+    department_diversity_ratio = unique_departments / total_items,
+    items_per_second = ifelse(total_time > 0, total_items / total_time, NA_real_),
+    items_per_department = total_items / unique_departments,
+    expected_time_given_size = predict(model_time, newdata = .),
+    time_deviation = avg_time_per_item - expected_time_given_size,
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+# CASE15 IF SCORE
+
+if_case15 <- case15_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(if_train$sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(if_train$price_per_second, na.rm = TRUE))
+  )
+
+X_case15_raw <- if_case15 %>%
+  select(-transaction_id)
+
+X_case15 <- scale(
+  X_case15_raw,
+  center = attr(X_train, "scaled:center"),
+  scale = attr(X_train, "scaled:scale")
+)
+
+if_case15$if_score <- predict(
+  if_model,
+  as.matrix(X_case15),
+  type = "score"
+)
+
+# CASE14 K-MEANS DISTANCE
+
+kmeans_case15 <- case15_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    range_time,
+    cv_time,
+    price_per_second,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    department_diversity_ratio,
+    items_per_second,
+    items_per_department,
+    time_deviation,
+    price_deviation,
+    long_pause_count
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(kmeans_train$sd_time_per_item, na.rm = TRUE)),
+    range_time = replace_na(range_time, median(kmeans_train$range_time, na.rm = TRUE)),
+    cv_time = replace_na(cv_time, median(kmeans_train$cv_time, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(kmeans_train$price_per_second, na.rm = TRUE)),
+    sd_price = replace_na(sd_price, median(kmeans_train$sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(kmeans_train$max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(kmeans_train$top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(kmeans_train$dominant_department_share, na.rm = TRUE)),
+    department_diversity_ratio = replace_na(department_diversity_ratio, median(kmeans_train$department_diversity_ratio, na.rm = TRUE)),
+    items_per_second = replace_na(items_per_second, median(kmeans_train$items_per_second, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(kmeans_train$items_per_department, na.rm = TRUE)),
+    time_deviation = replace_na(time_deviation, median(kmeans_train$time_deviation, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(kmeans_train$price_deviation, na.rm = TRUE)),
+    long_pause_count = replace_na(long_pause_count, 0)
+  )
+
+X_case15_kmeans_raw <- kmeans_case15 %>%
+  select(-transaction_id)
+
+X_case15_kmeans <- scale(
+  X_case15_kmeans_raw,
+  center = attr(X_kmeans, "scaled:center"),
+  scale = attr(X_kmeans, "scaled:scale")
+)
+
+centers <- kmeans_model$centers
+
+case15_distances <- apply(X_case15_kmeans, 1, function(row_vec) {
+  dists <- apply(centers, 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  min(dists)
+})
+
+case15_clusters <- apply(X_case15_kmeans, 1, function(row_vec) {
+  dists <- apply(centers, 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  which.min(dists)
+})
+
+cluster_sizes <- table(kmeans_model$cluster)
+
+kmeans_case15$cluster_id <- case14_clusters
+kmeans_case15$cluster_size <- as.numeric(cluster_sizes[as.character(case15_clusters)])
+kmeans_case15$distance_to_centroid <- case15_distances
+
+# FINAL CASE14 SCORE
+
+case15_if_kmeans <- case15_basket %>%
+  left_join(
+    if_case15 %>% select(transaction_id, if_score),
+    by = "transaction_id"
+  ) %>%
+  left_join(
+    kmeans_case15 %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    if_score_01 = percent_rank(if_score),
+    distance_to_centroid_01 = percent_rank(distance_to_centroid),
+    combined_ik_score =
+      0.50 * if_score_01 +
+      0.50 * distance_to_centroid_01
+  ) %>%
+  arrange(desc(combined_ik_score))
+
+top_150_if_kmeans_case15 <- case15_if_kmeans %>%
+  slice_head(n = 150)
+
+summary(top_150_if_kmeans_case15$if_score)
+summary(top_150_if_kmeans_case15$distance_to_centroid)
+summary(top_150_if_kmeans_case15$total_items)
+summary(top_150_if_kmeans_case15$total_price)
+
+writeLines(as.character(top_150_if_kmeans_case15$transaction_id))
+
+write.csv(
+  top_150_if_kmeans_case15,
+  "~/Desktop/top_150_if_kmeans_case14.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+

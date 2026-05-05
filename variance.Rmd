@@ -1,0 +1,317 @@
+---
+title: "dependency variance"
+output: pdf_document
+date: "2026-05-03"
+---
+
+# CASE 17
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# TRAIN
+
+```{r }
+library(tidyverse)
+
+# TRAIN DATA
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+slow_threshold <- quantile(long_data$time, 0.95, na.rm = TRUE)
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    long_pause_count = sum(time > slow_threshold, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- long_data %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments,
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_)
+  )
+
+# FIT NORMAL DEPENDENCIES
+
+m_price_items <- lm(total_price ~ total_items, data = basket_data)
+m_time_items  <- lm(avg_time_per_item ~ total_items, data = basket_data)
+m_depts_items <- lm(unique_departments ~ total_items, data = basket_data)
+m_share_price <- lm(max_price_share ~ total_price, data = basket_data)
+m_ipd_depts   <- lm(items_per_department ~ unique_departments, data = basket_data)
+m_pps_time    <- lm(price_per_second ~ total_time, data = basket_data)
+
+# robust residual scaling helper
+mad_safe <- function(x) {
+  v <- mad(x, constant = 1, na.rm = TRUE)
+  ifelse(is.na(v) || v <= 0, sd(x, na.rm = TRUE), v)
+}
+
+# TRAIN SCORES
+
+basket_dependency <- basket_data %>%
+  mutate(
+    pred_total_price = predict(m_price_items, newdata = .),
+    pred_avg_time_per_item = predict(m_time_items, newdata = .),
+    pred_unique_departments = predict(m_depts_items, newdata = .),
+    pred_max_price_share = predict(m_share_price, newdata = .),
+    pred_items_per_department = predict(m_ipd_depts, newdata = .),
+    pred_price_per_second = predict(m_pps_time, newdata = .)
+  ) %>%
+  mutate(
+    resid_total_price = total_price - pred_total_price,
+    resid_avg_time_per_item = avg_time_per_item - pred_avg_time_per_item,
+    resid_unique_departments = unique_departments - pred_unique_departments,
+    resid_max_price_share = max_price_share - pred_max_price_share,
+    resid_items_per_department = items_per_department - pred_items_per_department,
+    resid_price_per_second = price_per_second - pred_price_per_second
+  )
+
+scale_total_price <- mad_safe(basket_dependency$resid_total_price)
+scale_avg_time <- mad_safe(basket_dependency$resid_avg_time_per_item)
+scale_unique_depts <- mad_safe(basket_dependency$resid_unique_departments)
+scale_max_share <- mad_safe(basket_dependency$resid_max_price_share)
+scale_ipd <- mad_safe(basket_dependency$resid_items_per_department)
+scale_pps <- mad_safe(basket_dependency$resid_price_per_second)
+
+basket_dependency <- basket_dependency %>%
+  mutate(
+    z_total_price = abs(resid_total_price) / scale_total_price,
+    z_avg_time_per_item = abs(resid_avg_time_per_item) / scale_avg_time,
+    z_unique_departments = abs(resid_unique_departments) / scale_unique_depts,
+    z_max_price_share = abs(resid_max_price_share) / scale_max_share,
+    z_items_per_department = abs(resid_items_per_department) / scale_ipd,
+    z_price_per_second = abs(resid_price_per_second) / scale_pps,
+    dependency_violation_score =
+      z_total_price +
+      z_avg_time_per_item +
+      z_unique_departments +
+      z_max_price_share +
+      z_items_per_department +
+      z_price_per_second
+  ) %>%
+  arrange(desc(dependency_violation_score))
+
+top_150_dependency_train <- basket_dependency %>%
+  slice_head(n = 150)
+
+summary(top_150_dependency_train$total_items)
+summary(top_150_dependency_train$total_price)
+summary(top_150_dependency_train$avg_time_per_item)
+summary(top_150_dependency_train$dependency_violation_score)
+
+write.csv(
+  top_150_dependency_train,
+  "~/Desktop/top_150_dependency_train.csv",
+  row.names = FALSE
+)
+```
+
+```{r }
+# CASE17: PURE DEPENDENCY VIOLATION SCORE
+
+case17_lines <- readLines("~/Desktop/case17.csv", warn = FALSE)
+
+case17_raw <- tibble(
+  raw_line = case17_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case17_long <- case17_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+slow_threshold_case17 <- quantile(case17_long$time, 0.95, na.rm = TRUE)
+
+case17_basket <- case17_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    long_pause_count = sum(time > slow_threshold_case17, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+case17_dept_share <- case17_long %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+case17_basket <- case17_basket %>%
+  left_join(case17_dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments,
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_)
+  )
+
+# APPLY TRAINED DEPENDENCY MODELS
+
+case17_dependency <- case17_basket %>%
+  mutate(
+    pred_total_price = predict(m_price_items, newdata = .),
+    pred_avg_time_per_item = predict(m_time_items, newdata = .),
+    pred_unique_departments = predict(m_depts_items, newdata = .),
+    pred_max_price_share = predict(m_share_price, newdata = .),
+    pred_items_per_department = predict(m_ipd_depts, newdata = .),
+    pred_price_per_second = predict(m_pps_time, newdata = .)
+  ) %>%
+  mutate(
+    resid_total_price = total_price - pred_total_price,
+    resid_avg_time_per_item = avg_time_per_item - pred_avg_time_per_item,
+    resid_unique_departments = unique_departments - pred_unique_departments,
+    resid_max_price_share = max_price_share - pred_max_price_share,
+    resid_items_per_department = items_per_department - pred_items_per_department,
+    resid_price_per_second = price_per_second - pred_price_per_second
+  ) %>%
+  mutate(
+    z_total_price = abs(resid_total_price) / scale_total_price,
+    z_avg_time_per_item = abs(resid_avg_time_per_item) / scale_avg_time,
+    z_unique_departments = abs(resid_unique_departments) / scale_unique_depts,
+    z_max_price_share = abs(resid_max_price_share) / scale_max_share,
+    z_items_per_department = abs(resid_items_per_department) / scale_ipd,
+    z_price_per_second = abs(resid_price_per_second) / scale_pps,
+    dependency_violation_score =
+      z_total_price +
+      z_avg_time_per_item +
+      z_unique_departments +
+      z_max_price_share +
+      z_items_per_department +
+      z_price_per_second
+  ) %>%
+  arrange(desc(dependency_violation_score))
+
+top_150_dependency_case17 <- case17_dependency %>%
+  slice_head(n = 150)
+
+summary(top_150_dependency_case17$total_items)
+summary(top_150_dependency_case17$total_price)
+summary(top_150_dependency_case17$avg_time_per_item)
+summary(top_150_dependency_case17$dependency_violation_score)
+
+writeLines(as.character(top_150_dependency_case17$transaction_id))
+
+write.csv(
+  top_150_dependency_case17,
+  "~/Desktop/top_150_dependency_case17.csv",
+  row.names = FALSE
+)
+```
+
+```{r }
+```
+
+
+```{r }
+```

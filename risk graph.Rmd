@@ -1,0 +1,883 @@
+---
+title: "Untitled"
+output: pdf_document
+date: "2026-05-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+library(tidyverse)
+
+# TRAIN: RISK GRAPH
+# departments + shrinkage + stocktake + price
+
+```{r setup, include=FALSE}
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+# SHRINKAGE RISK
+
+shrinkage <- read.csv(
+  "~/Desktop/supermarket case/shrinkage.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    items_expected = as.numeric(items_expected),
+    revenue_expected = as.numeric(revenue_expected),
+    items_lost = as.numeric(items_lost),
+    revenue_lost = as.numeric(revenue_lost)
+  ) %>%
+  filter(!is.na(department))
+
+shrinkage_profile <- shrinkage %>%
+  mutate(
+    item_loss_rate = ifelse(items_expected > 0, items_lost / items_expected, NA_real_),
+    revenue_loss_rate = ifelse(revenue_expected > 0, revenue_lost / revenue_expected, NA_real_)
+  ) %>%
+  mutate(
+    shrinkage_risk =
+      0.35 * percent_rank(items_lost) +
+      0.35 * percent_rank(revenue_lost) +
+      0.15 * percent_rank(item_loss_rate) +
+      0.15 * percent_rank(revenue_loss_rate)
+  ) %>%
+  select(department, shrinkage_risk)
+
+# STOCKTAKE RISK
+
+stocktake <- read.csv(
+  "~/Desktop/supermarket case/stocktake_missing.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    item_value = as.numeric(item_value)
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(item_value),
+    item_value >= 0
+  )
+
+stocktake_profile <- stocktake %>%
+  group_by(department) %>%
+  summarise(
+    stocktake_count = n(),
+    stocktake_mean_value = mean(item_value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    stocktake_risk =
+      0.50 * percent_rank(stocktake_count) +
+      0.50 * percent_rank(stocktake_mean_value)
+  ) %>%
+  select(department, stocktake_risk)
+
+# ITEM-LEVEL RISK ENRICHMENT
+
+
+long_risk <- long_data %>%
+  left_join(shrinkage_profile, by = "department") %>%
+  left_join(stocktake_profile, by = "department") %>%
+  mutate(
+    shrinkage_risk = replace_na(shrinkage_risk, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk = replace_na(stocktake_risk, median(stocktake_profile$stocktake_risk, na.rm = TRUE))
+  )
+
+# DEPARTMENT PAIRS
+
+basket_depts <- long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    departments = list(sort(unique(department))),
+    .groups = "drop"
+  )
+
+pair_counts <- purrr::map_dfr(basket_depts$departments, function(depts) {
+  if (length(depts) < 2) {
+    return(tibble(dept_1 = integer(), dept_2 = integer()))
+  }
+  pairs <- t(combn(depts, 2))
+  tibble(
+    dept_1 = pairs[, 1],
+    dept_2 = pairs[, 2]
+  )
+}) %>%
+  dplyr::count(dept_1, dept_2, name = "pair_count")
+
+dept_counts <- basket_depts %>%
+  mutate(n_depts = lengths(departments)) %>%
+  select(transaction_id, departments) %>%
+  unnest_longer(departments, values_to = "department") %>%
+  dplyr::count(department, name = "dept_count")
+
+pair_conditional <- pair_counts %>%
+  left_join(
+    dept_counts %>% rename(dept_1 = department, dept_1_count = dept_count),
+    by = "dept_1"
+  ) %>%
+  left_join(
+    dept_counts %>% rename(dept_2 = department, dept_2_count = dept_count),
+    by = "dept_2"
+  ) %>%
+  mutate(
+    p_2_given_1 = pair_count / dept_1_count,
+    p_1_given_2 = pair_count / dept_2_count,
+    conditional_strength = (p_2_given_1 + p_1_given_2) / 2,
+    conditional_rarity = -log(conditional_strength)
+  )
+
+pair_risk <- pair_conditional %>%
+  left_join(
+    shrinkage_profile %>% rename(dept_1 = department, shrinkage_risk_1 = shrinkage_risk),
+    by = "dept_1"
+  ) %>%
+  left_join(
+    shrinkage_profile %>% rename(dept_2 = department, shrinkage_risk_2 = shrinkage_risk),
+    by = "dept_2"
+  ) %>%
+  left_join(
+    stocktake_profile %>% rename(dept_1 = department, stocktake_risk_1 = stocktake_risk),
+    by = "dept_1"
+  ) %>%
+  left_join(
+    stocktake_profile %>% rename(dept_2 = department, stocktake_risk_2 = stocktake_risk),
+    by = "dept_2"
+  ) %>%
+  mutate(
+    shrinkage_risk_1 = replace_na(shrinkage_risk_1, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    shrinkage_risk_2 = replace_na(shrinkage_risk_2, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk_1 = replace_na(stocktake_risk_1, median(stocktake_profile$stocktake_risk, na.rm = TRUE)),
+    stocktake_risk_2 = replace_na(stocktake_risk_2, median(stocktake_profile$stocktake_risk, na.rm = TRUE)),
+    pair_shrinkage_risk = (shrinkage_risk_1 + shrinkage_risk_2) / 2,
+    pair_stocktake_risk = (stocktake_risk_1 + stocktake_risk_2) / 2,
+    pair_risk_score = 0.5 * pair_shrinkage_risk + 0.5 * pair_stocktake_risk
+  )
+
+# BASKET-LEVEL GRAPH FEATURES
+
+basket_pairs <- basket_depts %>%
+  rowwise() %>%
+  mutate(
+    pair_tbl = list({
+      depts <- departments
+      if (length(depts) < 2) {
+        tibble(dept_1 = integer(), dept_2 = integer())
+      } else {
+        pairs <- t(combn(depts, 2))
+        tibble(dept_1 = pairs[, 1], dept_2 = pairs[, 2])
+      }
+    })
+  ) %>%
+  ungroup() %>%
+  select(transaction_id, pair_tbl) %>%
+  unnest(pair_tbl)
+
+basket_pair_features <- basket_pairs %>%
+  left_join(
+    pair_risk %>%
+      select(
+        dept_1,
+        dept_2,
+        conditional_rarity,
+        pair_shrinkage_risk,
+        pair_stocktake_risk,
+        pair_risk_score
+      ),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    mean_pair_rarity = mean(conditional_rarity, na.rm = TRUE),
+    max_pair_rarity = max(conditional_rarity, na.rm = TRUE),
+    mean_pair_shrinkage_risk = mean(pair_shrinkage_risk, na.rm = TRUE),
+    mean_pair_stocktake_risk = mean(pair_stocktake_risk, na.rm = TRUE),
+    mean_pair_risk_score = mean(pair_risk_score, na.rm = TRUE),
+    max_pair_risk_score = max(pair_risk_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+item_risk_features <- long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    avg_shrinkage_risk = mean(shrinkage_risk, na.rm = TRUE),
+    value_weighted_shrinkage_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * shrinkage_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    avg_stocktake_risk = mean(stocktake_risk, na.rm = TRUE),
+    value_weighted_stocktake_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * stocktake_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_shrinkage_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(shrinkage_risk >= quantile(shrinkage_profile$shrinkage_risk, 0.75, na.rm = TRUE), price, 0), na.rm = TRUE) /
+        sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_stocktake_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(stocktake_risk >= quantile(stocktake_profile$stocktake_risk, 0.75, na.rm = TRUE), price, 0), na.rm = TRUE) /
+        sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+risk_graph_train <- basket_data %>%
+  left_join(basket_pair_features, by = "transaction_id") %>%
+  left_join(item_risk_features, by = "transaction_id") %>%
+  mutate(
+    mean_pair_rarity = replace_na(mean_pair_rarity, 0),
+    max_pair_rarity = replace_na(max_pair_rarity, 0),
+    mean_pair_shrinkage_risk = replace_na(mean_pair_shrinkage_risk, median(mean_pair_shrinkage_risk, na.rm = TRUE)),
+    mean_pair_stocktake_risk = replace_na(mean_pair_stocktake_risk, median(mean_pair_stocktake_risk, na.rm = TRUE)),
+    mean_pair_risk_score = replace_na(mean_pair_risk_score, median(mean_pair_risk_score, na.rm = TRUE)),
+    max_pair_risk_score = replace_na(max_pair_risk_score, median(max_pair_risk_score, na.rm = TRUE)),
+    avg_shrinkage_risk = replace_na(avg_shrinkage_risk, median(avg_shrinkage_risk, na.rm = TRUE)),
+    value_weighted_shrinkage_risk = replace_na(value_weighted_shrinkage_risk, median(value_weighted_shrinkage_risk, na.rm = TRUE)),
+    avg_stocktake_risk = replace_na(avg_stocktake_risk, median(avg_stocktake_risk, na.rm = TRUE)),
+    value_weighted_stocktake_risk = replace_na(value_weighted_stocktake_risk, median(value_weighted_stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, median(high_shrinkage_value_share, na.rm = TRUE)),
+    high_stocktake_value_share = replace_na(high_stocktake_value_share, median(high_stocktake_value_share, na.rm = TRUE))
+  ) %>%
+  mutate(
+    risk_graph_score =
+      0.18 * percent_rank(mean_pair_rarity) +
+      0.08 * percent_rank(max_pair_rarity) +
+      0.12 * percent_rank(mean_pair_risk_score) +
+      0.07 * percent_rank(max_pair_risk_score) +
+      0.15 * percent_rank(value_weighted_shrinkage_risk) +
+      0.15 * percent_rank(value_weighted_stocktake_risk) +
+      0.10 * percent_rank(high_shrinkage_value_share) +
+      0.10 * percent_rank(high_stocktake_value_share) +
+      0.05 * percent_rank(price_deviation)
+  ) %>%
+  arrange(desc(risk_graph_score))
+
+top_150_risk_graph_train <- risk_graph_train %>%
+  slice_head(n = 150)
+
+summary(top_150_risk_graph_train$total_items)
+summary(top_150_risk_graph_train$total_price)
+summary(top_150_risk_graph_train$avg_price)
+summary(top_150_risk_graph_train$price_deviation)
+summary(top_150_risk_graph_train$mean_pair_rarity)
+summary(top_150_risk_graph_train$mean_pair_risk_score)
+summary(top_150_risk_graph_train$value_weighted_shrinkage_risk)
+summary(top_150_risk_graph_train$value_weighted_stocktake_risk)
+
+write.csv(
+  top_150_risk_graph_train,
+  "~/Desktop/top_150_risk_graph_train.csv",
+  row.names = FALSE
+)
+```
+
+# CASE37: RISK GRAPH
+
+```{r}
+library(tidyverse)
+
+# departments + shrinkage + stocktake + price
+
+case37_lines <- readLines("~/Desktop/case37.csv", warn = FALSE)
+
+case37_raw <- tibble(
+  raw_line = case37_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case37_long <- case37_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case37_basket <- case37_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+case37_basket <- case37_basket %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = case37_basket),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+case37_long_risk <- case37_long %>%
+  left_join(shrinkage_profile, by = "department") %>%
+  left_join(stocktake_profile, by = "department") %>%
+  mutate(
+    shrinkage_risk = replace_na(shrinkage_risk, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk = replace_na(stocktake_risk, median(stocktake_profile$stocktake_risk, na.rm = TRUE))
+  )
+
+case37_basket_depts <- case37_long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    departments = list(sort(unique(department))),
+    .groups = "drop"
+  )
+
+case37_basket_pairs <- case37_basket_depts %>%
+  rowwise() %>%
+  mutate(
+    pair_tbl = list({
+      depts <- departments
+      if (length(depts) < 2) {
+        tibble(dept_1 = integer(), dept_2 = integer())
+      } else {
+        pairs <- t(combn(depts, 2))
+        tibble(dept_1 = pairs[, 1], dept_2 = pairs[, 2])
+      }
+    })
+  ) %>%
+  ungroup() %>%
+  select(transaction_id, pair_tbl) %>%
+  unnest(pair_tbl)
+
+case37_pair_features <- case37_basket_pairs %>%
+  left_join(
+    pair_risk %>%
+      select(
+        dept_1,
+        dept_2,
+        conditional_rarity,
+        pair_shrinkage_risk,
+        pair_stocktake_risk,
+        pair_risk_score
+      ),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  mutate(
+    conditional_rarity = replace_na(conditional_rarity, max(pair_risk$conditional_rarity, na.rm = TRUE)),
+    pair_shrinkage_risk = replace_na(pair_shrinkage_risk, median(pair_risk$pair_shrinkage_risk, na.rm = TRUE)),
+    pair_stocktake_risk = replace_na(pair_stocktake_risk, median(pair_risk$pair_stocktake_risk, na.rm = TRUE)),
+    pair_risk_score = replace_na(pair_risk_score, median(pair_risk$pair_risk_score, na.rm = TRUE))
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    mean_pair_rarity = mean(conditional_rarity, na.rm = TRUE),
+    max_pair_rarity = max(conditional_rarity, na.rm = TRUE),
+    mean_pair_shrinkage_risk = mean(pair_shrinkage_risk, na.rm = TRUE),
+    mean_pair_stocktake_risk = mean(pair_stocktake_risk, na.rm = TRUE),
+    mean_pair_risk_score = mean(pair_risk_score, na.rm = TRUE),
+    max_pair_risk_score = max(pair_risk_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+case37_item_risk_features <- case37_long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    avg_shrinkage_risk = mean(shrinkage_risk, na.rm = TRUE),
+    value_weighted_shrinkage_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * shrinkage_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    avg_stocktake_risk = mean(stocktake_risk, na.rm = TRUE),
+    value_weighted_stocktake_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * stocktake_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_shrinkage_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(shrinkage_risk >= quantile(shrinkage_profile$shrinkage_risk, 0.75, na.rm = TRUE), price, 0), na.rm = TRUE) /
+        sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_stocktake_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(stocktake_risk >= quantile(stocktake_profile$stocktake_risk, 0.75, na.rm = TRUE), price, 0), na.rm = TRUE) /
+        sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+risk_graph_case37 <- case37_basket %>%
+  left_join(case37_pair_features, by = "transaction_id") %>%
+  left_join(case37_item_risk_features, by = "transaction_id") %>%
+  mutate(
+    mean_pair_rarity = replace_na(mean_pair_rarity, 0),
+    max_pair_rarity = replace_na(max_pair_rarity, 0),
+    mean_pair_shrinkage_risk = replace_na(mean_pair_shrinkage_risk, median(mean_pair_shrinkage_risk, na.rm = TRUE)),
+    mean_pair_stocktake_risk = replace_na(mean_pair_stocktake_risk, median(mean_pair_stocktake_risk, na.rm = TRUE)),
+    mean_pair_risk_score = replace_na(mean_pair_risk_score, median(mean_pair_risk_score, na.rm = TRUE)),
+    max_pair_risk_score = replace_na(max_pair_risk_score, median(max_pair_risk_score, na.rm = TRUE)),
+    avg_shrinkage_risk = replace_na(avg_shrinkage_risk, median(avg_shrinkage_risk, na.rm = TRUE)),
+    value_weighted_shrinkage_risk = replace_na(value_weighted_shrinkage_risk, median(value_weighted_shrinkage_risk, na.rm = TRUE)),
+    avg_stocktake_risk = replace_na(avg_stocktake_risk, median(avg_stocktake_risk, na.rm = TRUE)),
+    value_weighted_stocktake_risk = replace_na(value_weighted_stocktake_risk, median(value_weighted_stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, median(high_shrinkage_value_share, na.rm = TRUE)),
+    high_stocktake_value_share = replace_na(high_stocktake_value_share, median(high_stocktake_value_share, na.rm = TRUE))
+  ) %>%
+  mutate(
+    risk_graph_score =
+      0.18 * percent_rank(mean_pair_rarity) +
+      0.08 * percent_rank(max_pair_rarity) +
+      0.12 * percent_rank(mean_pair_risk_score) +
+      0.07 * percent_rank(max_pair_risk_score) +
+      0.15 * percent_rank(value_weighted_shrinkage_risk) +
+      0.15 * percent_rank(value_weighted_stocktake_risk) +
+      0.10 * percent_rank(high_shrinkage_value_share) +
+      0.10 * percent_rank(high_stocktake_value_share) +
+      0.05 * percent_rank(price_deviation)
+  ) %>%
+  arrange(desc(risk_graph_score))
+
+top_150_risk_graph_case37 <- risk_graph_case37 %>%
+  slice_head(n = 150)
+
+summary(top_150_risk_graph_case37$total_items)
+summary(top_150_risk_graph_case37$total_price)
+summary(top_150_risk_graph_case37$avg_price)
+summary(top_150_risk_graph_case37$price_deviation)
+summary(top_150_risk_graph_case37$mean_pair_rarity)
+summary(top_150_risk_graph_case37$mean_pair_risk_score)
+summary(top_150_risk_graph_case37$value_weighted_shrinkage_risk)
+summary(top_150_risk_graph_case37$value_weighted_stocktake_risk)
+
+writeLines(as.character(top_150_risk_graph_case37$transaction_id))
+
+write.csv(
+  top_150_risk_graph_case37,
+  "~/Desktop/top_150_risk_graph_case37.csv",
+  row.names = FALSE
+)
+```
+
+1. Graph-Heavy
+
+
+```{r}
+risk_graph_train_v_graph <- risk_graph_train %>%
+  mutate(
+    risk_graph_score_v_graph =
+      0.22 * percent_rank(mean_pair_rarity) +
+      0.10 * percent_rank(max_pair_rarity) +
+      0.12 * percent_rank(mean_pair_risk_score) +
+      0.06 * percent_rank(max_pair_risk_score) +
+      0.12 * percent_rank(value_weighted_shrinkage_risk) +
+      0.12 * percent_rank(value_weighted_stocktake_risk) +
+      0.10 * percent_rank(high_shrinkage_value_share) +
+      0.10 * percent_rank(high_stocktake_value_share) +
+      0.06 * percent_rank(price_deviation)
+  ) %>%
+  arrange(desc(risk_graph_score_v_graph))
+
+top_150_risk_graph_train_v_graph <- risk_graph_train_v_graph %>%
+  slice_head(n = 150)
+
+summary(top_150_risk_graph_train_v_graph$total_items)
+summary(top_150_risk_graph_train_v_graph$total_price)
+summary(top_150_risk_graph_train_v_graph$avg_price)
+summary(top_150_risk_graph_train_v_graph$price_deviation)
+summary(top_150_risk_graph_train_v_graph$mean_pair_rarity)
+summary(top_150_risk_graph_train_v_graph$mean_pair_risk_score)
+summary(top_150_risk_graph_train_v_graph$value_weighted_shrinkage_risk)
+summary(top_150_risk_graph_train_v_graph$value_weighted_stocktake_risk)
+
+write.csv(
+  top_150_risk_graph_train_v_graph,
+  "~/Desktop/top_150_risk_graph_train_v_graph.csv",
+  row.names = FALSE
+)
+```
+
+2. Risk-Heavy
+
+
+```{r}
+risk_graph_train_v_risk <- risk_graph_train %>%
+  mutate(
+    risk_graph_score_v_risk =
+      0.14 * percent_rank(mean_pair_rarity) +
+      0.06 * percent_rank(max_pair_rarity) +
+      0.14 * percent_rank(mean_pair_risk_score) +
+      0.08 * percent_rank(max_pair_risk_score) +
+      0.18 * percent_rank(value_weighted_shrinkage_risk) +
+      0.18 * percent_rank(value_weighted_stocktake_risk) +
+      0.10 * percent_rank(high_shrinkage_value_share) +
+      0.08 * percent_rank(high_stocktake_value_share) +
+      0.04 * percent_rank(price_deviation)
+  ) %>%
+  arrange(desc(risk_graph_score_v_risk))
+
+top_150_risk_graph_train_v_risk <- risk_graph_train_v_risk %>%
+  slice_head(n = 150)
+
+summary(top_150_risk_graph_train_v_risk$total_items)
+summary(top_150_risk_graph_train_v_risk$total_price)
+summary(top_150_risk_graph_train_v_risk$avg_price)
+summary(top_150_risk_graph_train_v_risk$price_deviation)
+summary(top_150_risk_graph_train_v_risk$mean_pair_rarity)
+summary(top_150_risk_graph_train_v_risk$mean_pair_risk_score)
+summary(top_150_risk_graph_train_v_risk$value_weighted_shrinkage_risk)
+summary(top_150_risk_graph_train_v_risk$value_weighted_stocktake_risk)
+
+write.csv(
+  top_150_risk_graph_train_v_risk,
+  "~/Desktop/top_150_risk_graph_train_v_risk.csv",
+  row.names = FALSE
+)
+```
+
+3. Value-Heavy
+
+```{r}
+risk_graph_train_v_value <- risk_graph_train %>%
+  mutate(
+    risk_graph_score_v_value =
+      0.14 * percent_rank(mean_pair_rarity) +
+      0.06 * percent_rank(max_pair_rarity) +
+      0.10 * percent_rank(mean_pair_risk_score) +
+      0.06 * percent_rank(max_pair_risk_score) +
+      0.16 * percent_rank(value_weighted_shrinkage_risk) +
+      0.16 * percent_rank(value_weighted_stocktake_risk) +
+      0.10 * percent_rank(high_shrinkage_value_share) +
+      0.10 * percent_rank(high_stocktake_value_share) +
+      0.12 * percent_rank(price_deviation)
+  ) %>%
+  arrange(desc(risk_graph_score_v_value))
+
+top_150_risk_graph_train_v_value <- risk_graph_train_v_value %>%
+  slice_head(n = 150)
+
+summary(top_150_risk_graph_train_v_value$total_items)
+summary(top_150_risk_graph_train_v_value$total_price)
+summary(top_150_risk_graph_train_v_value$avg_price)
+summary(top_150_risk_graph_train_v_value$price_deviation)
+summary(top_150_risk_graph_train_v_value$mean_pair_rarity)
+summary(top_150_risk_graph_train_v_value$mean_pair_risk_score)
+summary(top_150_risk_graph_train_v_value$value_weighted_shrinkage_risk)
+summary(top_150_risk_graph_train_v_value$value_weighted_stocktake_risk)
+
+write.csv(
+  top_150_risk_graph_train_v_value,
+  "~/Desktop/top_150_risk_graph_train_v_value.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+library(tidyverse)
+
+# CASE38: VALUE-HEAVY RISK GRAPH
+
+case38_lines <- readLines("~/Desktop/case38.csv", warn = FALSE)
+
+case38_raw <- tibble(
+  raw_line = case38_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case38_long <- case38_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case38_basket <- case38_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+case38_basket <- case38_basket %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = case38_basket),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+case38_long_risk <- case38_long %>%
+  left_join(shrinkage_profile, by = "department") %>%
+  left_join(stocktake_profile, by = "department") %>%
+  mutate(
+    shrinkage_risk = replace_na(shrinkage_risk, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk = replace_na(stocktake_risk, median(stocktake_profile$stocktake_risk, na.rm = TRUE))
+  )
+
+case38_basket_depts <- case38_long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    departments = list(sort(unique(department))),
+    .groups = "drop"
+  )
+
+case38_basket_pairs <- case38_basket_depts %>%
+  rowwise() %>%
+  mutate(
+    pair_tbl = list({
+      depts <- departments
+      if (length(depts) < 2) {
+        tibble(dept_1 = integer(), dept_2 = integer())
+      } else {
+        pairs <- t(combn(depts, 2))
+        tibble(dept_1 = pairs[, 1], dept_2 = pairs[, 2])
+      }
+    })
+  ) %>%
+  ungroup() %>%
+  select(transaction_id, pair_tbl) %>%
+  unnest(pair_tbl)
+
+case38_pair_features <- case38_basket_pairs %>%
+  left_join(
+    pair_risk %>%
+      select(
+        dept_1,
+        dept_2,
+        conditional_rarity,
+        pair_shrinkage_risk,
+        pair_stocktake_risk,
+        pair_risk_score
+      ),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  mutate(
+    conditional_rarity = replace_na(conditional_rarity, max(pair_risk$conditional_rarity, na.rm = TRUE)),
+    pair_shrinkage_risk = replace_na(pair_shrinkage_risk, median(pair_risk$pair_shrinkage_risk, na.rm = TRUE)),
+    pair_stocktake_risk = replace_na(pair_stocktake_risk, median(pair_risk$pair_stocktake_risk, na.rm = TRUE)),
+    pair_risk_score = replace_na(pair_risk_score, median(pair_risk$pair_risk_score, na.rm = TRUE))
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    mean_pair_rarity = mean(conditional_rarity, na.rm = TRUE),
+    max_pair_rarity = max(conditional_rarity, na.rm = TRUE),
+    mean_pair_shrinkage_risk = mean(pair_shrinkage_risk, na.rm = TRUE),
+    mean_pair_stocktake_risk = mean(pair_stocktake_risk, na.rm = TRUE),
+    mean_pair_risk_score = mean(pair_risk_score, na.rm = TRUE),
+    max_pair_risk_score = max(pair_risk_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+case38_item_risk_features <- case38_long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    avg_shrinkage_risk = mean(shrinkage_risk, na.rm = TRUE),
+    value_weighted_shrinkage_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * shrinkage_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    avg_stocktake_risk = mean(stocktake_risk, na.rm = TRUE),
+    value_weighted_stocktake_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * stocktake_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_shrinkage_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(shrinkage_risk >= quantile(shrinkage_profile$shrinkage_risk, 0.75, na.rm = TRUE), price, 0), na.rm = TRUE) /
+        sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_stocktake_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(stocktake_risk >= quantile(stocktake_profile$stocktake_risk, 0.75, na.rm = TRUE), price, 0), na.rm = TRUE) /
+        sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+risk_graph_case38 <- case38_basket %>%
+  left_join(case38_pair_features, by = "transaction_id") %>%
+  left_join(case38_item_risk_features, by = "transaction_id") %>%
+  mutate(
+    mean_pair_rarity = replace_na(mean_pair_rarity, 0),
+    max_pair_rarity = replace_na(max_pair_rarity, 0),
+    mean_pair_shrinkage_risk = replace_na(mean_pair_shrinkage_risk, median(mean_pair_shrinkage_risk, na.rm = TRUE)),
+    mean_pair_stocktake_risk = replace_na(mean_pair_stocktake_risk, median(mean_pair_stocktake_risk, na.rm = TRUE)),
+    mean_pair_risk_score = replace_na(mean_pair_risk_score, median(mean_pair_risk_score, na.rm = TRUE)),
+    max_pair_risk_score = replace_na(max_pair_risk_score, median(max_pair_risk_score, na.rm = TRUE)),
+    avg_shrinkage_risk = replace_na(avg_shrinkage_risk, median(avg_shrinkage_risk, na.rm = TRUE)),
+    value_weighted_shrinkage_risk = replace_na(value_weighted_shrinkage_risk, median(value_weighted_shrinkage_risk, na.rm = TRUE)),
+    avg_stocktake_risk = replace_na(avg_stocktake_risk, median(avg_stocktake_risk, na.rm = TRUE)),
+    value_weighted_stocktake_risk = replace_na(value_weighted_stocktake_risk, median(value_weighted_stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, median(high_shrinkage_value_share, na.rm = TRUE)),
+    high_stocktake_value_share = replace_na(high_stocktake_value_share, median(high_stocktake_value_share, na.rm = TRUE))
+  ) %>%
+  mutate(
+    risk_graph_score_v_value =
+      0.14 * percent_rank(mean_pair_rarity) +
+      0.06 * percent_rank(max_pair_rarity) +
+      0.10 * percent_rank(mean_pair_risk_score) +
+      0.06 * percent_rank(max_pair_risk_score) +
+      0.16 * percent_rank(value_weighted_shrinkage_risk) +
+      0.16 * percent_rank(value_weighted_stocktake_risk) +
+      0.10 * percent_rank(high_shrinkage_value_share) +
+      0.10 * percent_rank(high_stocktake_value_share) +
+      0.12 * percent_rank(price_deviation)
+  ) %>%
+  arrange(desc(risk_graph_score_v_value))
+
+top_150_risk_graph_case38_v_value <- risk_graph_case38 %>%
+  slice_head(n = 150)
+
+summary(top_150_risk_graph_case38_v_value$total_items)
+summary(top_150_risk_graph_case38_v_value$total_price)
+summary(top_150_risk_graph_case38_v_value$avg_price)
+summary(top_150_risk_graph_case38_v_value$price_deviation)
+summary(top_150_risk_graph_case38_v_value$mean_pair_rarity)
+summary(top_150_risk_graph_case38_v_value$mean_pair_risk_score)
+summary(top_150_risk_graph_case38_v_value$value_weighted_shrinkage_risk)
+summary(top_150_risk_graph_case38_v_value$value_weighted_stocktake_risk)
+
+writeLines(as.character(top_150_risk_graph_case38_v_value$transaction_id))
+
+write.csv(
+  top_150_risk_graph_case38_v_value,
+  "~/Desktop/top_150_risk_graph_case38_v_value.csv",
+  row.names = FALSE
+)
+```
+
+

@@ -1,0 +1,305 @@
+---
+title: "LOF"
+output: pdf_document
+date: "2026-05-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(dbscan)
+
+# ==========================================
+# PURE LOF ON IF1 FEATURE SPACE
+# compact IF space + price_deviation
+# ==========================================
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    price_per_second = ifelse(
+      sum(time, na.rm = TRUE) > 0,
+      sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+      NA_real_
+    ),
+    max_price = max(price, na.rm = TRUE),
+    max_price_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      max(price, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+lof_train <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    price_deviation
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE))
+  )
+
+X_lof_raw <- lof_train %>%
+  select(-transaction_id)
+
+X_lof <- scale(X_lof_raw)
+
+# try minPts = 20 first
+lof_train$lof_score <- dbscan::lof(
+  as.matrix(X_lof),
+  minPts = 20
+)
+
+top_150_lof_train <- lof_train %>%
+  arrange(desc(lof_score)) %>%
+  slice_head(n = 150)
+
+summary(top_150_lof_train$total_items)
+summary(top_150_lof_train$total_price)
+summary(top_150_lof_train$avg_time_per_item)
+summary(top_150_lof_train$price_deviation)
+summary(top_150_lof_train$lof_score)
+
+write.csv(
+  top_150_lof_train,
+  "~/Desktop/top_150_lof_train_if1_space.csv",
+  row.names = FALSE
+)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(dbscan)
+
+# CASE26: PURE LOF ON IF1 FEATURE SPACE
+
+case26_lines <- readLines("~/Desktop/case26.csv", warn = FALSE)
+
+case26_raw <- tibble(
+  raw_line = case26_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case26_long <- case26_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case26_basket <- case26_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    price_per_second = ifelse(
+      sum(time, na.rm = TRUE) > 0,
+      sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+      NA_real_
+    ),
+    max_price = max(price, na.rm = TRUE),
+    max_price_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      max(price, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+case26_basket <- case26_basket %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = case26_basket),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+lof_case26 <- case26_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    price_deviation
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(lof_train$sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(lof_train$price_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(lof_train$max_price_share, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(lof_train$price_deviation, na.rm = TRUE))
+  )
+
+X_case26_raw <- lof_case26 %>%
+  select(-transaction_id)
+
+X_case26 <- scale(
+  X_case26_raw,
+  center = attr(X_lof, "scaled:center"),
+  scale = attr(X_lof, "scaled:scale")
+)
+
+# LOF is neighbor-based, so we compute on train + case together,
+# then take only the case rows at the end
+X_lof_combined <- rbind(as.matrix(X_lof), as.matrix(X_case26))
+
+lof_combined_scores <- dbscan::lof(
+  X_lof_combined,
+  minPts = 20
+)
+
+lof_case26$lof_score <- tail(lof_combined_scores, nrow(X_case26))
+
+top_150_lof_case26 <- lof_case26 %>%
+  arrange(desc(lof_score)) %>%
+  slice_head(n = 150)
+
+summary(top_150_lof_case26$total_items)
+summary(top_150_lof_case26$total_price)
+summary(top_150_lof_case26$avg_time_per_item)
+summary(top_150_lof_case26$price_deviation)
+summary(top_150_lof_case26$lof_score)
+
+writeLines(as.character(top_150_lof_case26$transaction_id))
+
+write.csv(
+  top_150_lof_case26,
+  "~/Desktop/top_150_lof_case26_if1_space.csv",
+  row.names = FALSE
+)
+```
+
+
+
+
+
+
+
+
+
+

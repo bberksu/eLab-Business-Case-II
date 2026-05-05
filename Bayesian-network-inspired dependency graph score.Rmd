@@ -1,0 +1,288 @@
+---
+title: "Bayesian-network-inspired dependency graph score"
+output: pdf_document
+date: "2026-05-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+
+# BAYESIAN-NETWORK-INSPIRED DEPENDENCY GRAPH SCORE
+# standalone version on supermarket train
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+# BASKET FEATURES
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- long_data %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments
+  )
+
+# CO-OCCURRENCE SCORE
+
+basket_depts <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    depts = list(sort(unique(department))),
+    .groups = "drop"
+  )
+
+edge_counts <- purrr::map_dfr(basket_depts$depts, function(depts) {
+  if (length(depts) < 2) {
+    return(tibble(dept_a = integer(), dept_b = integer()))
+  }
+  pairs <- t(combn(depts, 2))
+  tibble(
+    dept_a = pairs[, 1],
+    dept_b = pairs[, 2]
+  )
+}) %>%
+  dplyr::count(dept_a, dept_b, name = "edge_n")
+
+edge_lookup <- edge_counts %>%
+  mutate(
+    edge_key = paste(dept_a, dept_b, sep = "_"),
+    edge_commonness = edge_n / max(edge_n),
+    edge_surprise = 1 - edge_commonness
+  )
+
+edge_surprise_lookup <- edge_lookup$edge_surprise
+names(edge_surprise_lookup) <- edge_lookup$edge_key
+
+get_edge_keys <- function(depts) {
+  depts <- sort(unique(depts))
+  if (length(depts) < 2) return(character(0))
+  pairs <- t(combn(depts, 2))
+  paste(pairs[, 1], pairs[, 2], sep = "_")
+}
+
+cooccurrence_score_tbl <- basket_depts %>%
+  rowwise() %>%
+  mutate(
+    edge_keys = list(get_edge_keys(depts)),
+    cooccurrence_score = ifelse(
+      length(edge_keys) > 0,
+      mean(edge_surprise_lookup[edge_keys], na.rm = TRUE),
+      0
+    )
+  ) %>%
+  ungroup() %>%
+  select(transaction_id, cooccurrence_score)
+
+basket_data <- basket_data %>%
+  left_join(cooccurrence_score_tbl, by = "transaction_id")
+
+# DEPARTMENT RISK FROM STOCKTAKE
+
+stocktake <- read.csv(
+  "~/Desktop/supermarket case/stocktake_missing.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    item_value = as.numeric(item_value)
+  ) %>%
+  filter(!is.na(department), !is.na(item_value), item_value >= 0)
+
+stocktake_profile <- stocktake %>%
+  group_by(department) %>%
+  summarise(
+    missing_count = n(),
+    missing_mean_value = mean(item_value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    dept_risk = 0.5 * percent_rank(missing_count) +
+                0.5 * percent_rank(missing_mean_value)
+  )
+
+long_risk <- long_data %>%
+  left_join(
+    stocktake_profile %>% select(department, dept_risk),
+    by = "department"
+  ) %>%
+  mutate(
+    dept_risk = replace_na(dept_risk, median(stocktake_profile$dept_risk, na.rm = TRUE))
+  )
+
+risk_tbl <- long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    avg_department_risk = mean(dept_risk, na.rm = TRUE),
+    value_weighted_department_risk = sum(price * dept_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(risk_tbl, by = "transaction_id")
+
+# EXPECTED DEPENDENCIES
+
+m_price_items <- lm(total_price ~ total_items, data = basket_data)
+m_time_items <- lm(total_time ~ total_items, data = basket_data)
+m_maxshare_maxprice <- lm(max_price_share ~ max_price, data = basket_data)
+m_cooccur_depts <- lm(cooccurrence_score ~ unique_departments, data = basket_data)
+m_valueconc_risk <- lm(max_price_share ~ avg_department_risk, data = basket_data)
+
+mad_safe <- function(x) {
+  v <- mad(x, constant = 1, na.rm = TRUE)
+  if (is.na(v) || v <= 0) sd(x, na.rm = TRUE) else v
+}
+
+basket_bn <- basket_data %>%
+  mutate(
+    pred_total_price = predict(m_price_items, newdata = .),
+    pred_total_time = predict(m_time_items, newdata = .),
+    pred_max_price_share = predict(m_maxshare_maxprice, newdata = .),
+    pred_cooccurrence_score = predict(m_cooccur_depts, newdata = .),
+    pred_value_concentration = predict(m_valueconc_risk, newdata = .)
+  ) %>%
+  mutate(
+    resid_price_items = total_price - pred_total_price,
+    resid_time_items = total_time - pred_total_time,
+    resid_maxshare_maxprice = max_price_share - pred_max_price_share,
+    resid_cooccur_depts = cooccurrence_score - pred_cooccurrence_score,
+    resid_valueconc_risk = max_price_share - pred_value_concentration
+  )
+
+scale_price_items <- mad_safe(basket_bn$resid_price_items)
+scale_time_items <- mad_safe(basket_bn$resid_time_items)
+scale_maxshare_maxprice <- mad_safe(basket_bn$resid_maxshare_maxprice)
+scale_cooccur_depts <- mad_safe(basket_bn$resid_cooccur_depts)
+scale_valueconc_risk <- mad_safe(basket_bn$resid_valueconc_risk)
+
+basket_bn <- basket_bn %>%
+  mutate(
+    z_price_items = abs(resid_price_items) / scale_price_items,
+    z_time_items = abs(resid_time_items) / scale_time_items,
+    z_maxshare_maxprice = abs(resid_maxshare_maxprice) / scale_maxshare_maxprice,
+    z_cooccur_depts = abs(resid_cooccur_depts) / scale_cooccur_depts,
+    z_valueconc_risk = abs(resid_valueconc_risk) / scale_valueconc_risk,
+    dependency_graph_score =
+      z_price_items +
+      z_time_items +
+      z_maxshare_maxprice +
+      z_cooccur_depts +
+      z_valueconc_risk
+  ) %>%
+  arrange(desc(dependency_graph_score))
+
+top_150_dependency_graph_train <- basket_bn %>%
+  slice_head(n = 150)
+
+summary(top_150_dependency_graph_train$total_items)
+summary(top_150_dependency_graph_train$total_price)
+summary(top_150_dependency_graph_train$avg_time_per_item)
+summary(top_150_dependency_graph_train$cooccurrence_score)
+summary(top_150_dependency_graph_train$avg_department_risk)
+summary(top_150_dependency_graph_train$dependency_graph_score)
+
+write.csv(
+  top_150_dependency_graph_train,
+  "~/Desktop/top_150_dependency_graph_train.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+
+```{r}
+```
+
+
+
+```{r}
+```

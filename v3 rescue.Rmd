@@ -1,0 +1,313 @@
+---
+title: "if + clustering"
+output: pdf_document
+date: "2026-05-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(isotree)
+
+# ==========================================
+# TRAIN: CLUSTERING-FIRST + SMALL IF1 RESCUE
+# top 130 from best clustering
+# + top 20 from IF1 not already selected
+# stricter IF rescue filter
+# ==========================================
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    price_per_second = ifelse(
+      sum(time, na.rm = TRUE) > 0,
+      sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+      NA_real_
+    ),
+    max_price = max(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- long_data %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments
+  )
+
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+rescue_price_threshold <- quantile(basket_data$total_price, 0.75, na.rm = TRUE)
+
+# ==========================================
+# IF1
+# ==========================================
+
+if_train_if1 <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    price_deviation
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE))
+  )
+
+X_if1_raw <- if_train_if1 %>%
+  select(-transaction_id)
+
+X_if1 <- scale(X_if1_raw)
+
+if_model_if1 <- isolation.forest(
+  as.matrix(X_if1),
+  ntrees = 300,
+  sample_size = 512,
+  ndim = 1,
+  nthreads = 1
+)
+
+if_train_if1$if_score <- predict(
+  if_model_if1,
+  as.matrix(X_if1),
+  type = "score"
+)
+
+# ==========================================
+# BEST CLUSTERING
+# ==========================================
+
+kmeans_train_v2 <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    avg_time_per_item,
+    price_per_second,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    items_per_department,
+    price_deviation
+  ) %>%
+  mutate(
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    sd_price = replace_na(sd_price, median(sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(dominant_department_share, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(items_per_department, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE))
+  )
+
+X_kmeans_v2_raw <- kmeans_train_v2 %>%
+  select(-transaction_id)
+
+X_kmeans_v2 <- scale(X_kmeans_v2_raw)
+
+set.seed(123)
+kmeans_model_v2 <- kmeans(
+  X_kmeans_v2,
+  centers = 8,
+  nstart = 20,
+  iter.max = 100
+)
+
+kmeans_train_v2$cluster_id <- kmeans_model_v2$cluster
+centers_v2 <- kmeans_model_v2$centers
+
+assigned_distances_v2 <- map2_dbl(
+  split(as.data.frame(X_kmeans_v2), seq_len(nrow(X_kmeans_v2))),
+  kmeans_model_v2$cluster,
+  ~ {
+    row_vec <- as.numeric(.x[1, ])
+    center_vec <- centers_v2[.y, ]
+    sqrt(sum((row_vec - center_vec)^2))
+  }
+)
+
+kmeans_train_v2$distance_to_centroid <- assigned_distances_v2
+
+cluster_sizes_v2 <- table(kmeans_model_v2$cluster)
+
+kmeans_train_v2 <- kmeans_train_v2 %>%
+  mutate(
+    cluster_size = as.numeric(cluster_sizes_v2[as.character(cluster_id)])
+  )
+
+# ==========================================
+# CLUSTER-FIRST + SMALL IF RESCUE
+# ==========================================
+
+train_ranked <- basket_data %>%
+  left_join(
+    if_train_if1 %>% select(transaction_id, if_score),
+    by = "transaction_id"
+  ) %>%
+  left_join(
+    kmeans_train_v2 %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    if_score_01 = percent_rank(if_score),
+    distance_to_centroid_01 = percent_rank(distance_to_centroid)
+  )
+
+top_130_cluster <- train_ranked %>%
+  arrange(desc(distance_to_centroid)) %>%
+  slice_head(n = 130) %>%
+  mutate(selection_source = "cluster")
+
+top_20_if_rescue <- train_ranked %>%
+  filter(
+    !transaction_id %in% top_130_cluster$transaction_id,
+    price_deviation > 0,
+    total_price > rescue_price_threshold,
+    total_items >= 8
+  ) %>%
+  arrange(desc(if_score)) %>%
+  slice_head(n = 20) %>%
+  mutate(selection_source = "if_rescue")
+
+top_150_cluster_if_rescue_v3_train <- bind_rows(
+  top_130_cluster,
+  top_20_if_rescue
+) %>%
+  arrange(desc(distance_to_centroid_01), desc(if_score_01))
+
+summary(top_150_cluster_if_rescue_v3_train$total_items)
+summary(top_150_cluster_if_rescue_v3_train$total_price)
+summary(top_150_cluster_if_rescue_v3_train$avg_time_per_item)
+summary(top_150_cluster_if_rescue_v3_train$price_deviation)
+table(top_150_cluster_if_rescue_v3_train$selection_source)
+
+write.csv(
+  top_150_cluster_if_rescue_v3_train,
+  "~/Desktop/top_150_cluster_if_rescue_v3_train.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+

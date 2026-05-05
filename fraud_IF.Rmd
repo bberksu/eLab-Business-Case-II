@@ -219,7 +219,7 @@ ggplot() +
 # Fraud risk detection on unseen data: case0
 
 ```{r}
-case0_lines <- readLines("~/Desktop/case0.csv", warn = FALSE)
+case0_lines <- readLines("~/Desktop/case12.csv", warn = FALSE)
 
 case0_raw <- tibble(
   transaction_id = 1:length(case0_lines),
@@ -1482,27 +1482,4 @@ View(top_if_train %>%
   ))
 ```
 
-
-
-
-```{r}
-
-```
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-```
-
-
-
-```{r}
-
-```
 

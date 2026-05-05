@@ -2672,3 +2672,363 @@ readr::write_csv(
   "~/Desktop/supermarket case/test cases/top_150_case8_baseline_if_graph.csv"
 )
 ```
+
+
+
+# OPTUNA!!!!! КАЛИБРОВКА ВЕСОВ
+
+
+```{r}
+library(reticulate)
+
+use_virtualenv("~/.virtualenvs/r-reticulate", required = TRUE)
+optuna <- import("optuna")
+
+names(baseline_train)
+```
+
+```{r}
+objective <- function(trial) {
+  w_baseline <- trial$suggest_float("w_baseline", 0.0, 0.4)
+  w_if       <- trial$suggest_float("w_if",       0.2, 0.7)
+  w_graph    <- trial$suggest_float("w_graph",    0.1, 0.5)
+
+  top_k <- trial$suggest_categorical("top_k", list(100L, 125L, 150L, 175L, 200L))
+
+  w_sum <- w_baseline + w_if + w_graph
+  w_baseline <- w_baseline / w_sum
+  w_if <- w_if / w_sum
+  w_graph <- w_graph / w_sum
+
+  scored <- baseline_train %>%
+    mutate(
+      optuna_score =
+        w_baseline * baseline_score_01 +
+        w_if * if_score_01 +
+        w_graph * graph_score_01
+    ) %>%
+    arrange(desc(optuna_score))
+
+  top_data <- scored %>%
+    slice_head(n = top_k)
+
+  mean_items <- mean(top_data$total_items, na.rm = TRUE)
+  mean_price <- mean(top_data$total_price, na.rm = TRUE)
+
+  # простая нормализация штрафов
+  items_penalty <- mean_items / max(baseline_train$total_items, na.rm = TRUE)
+  price_penalty <- mean_price / max(baseline_train$total_price, na.rm = TRUE)
+
+  rule_bonus <- mean(
+    as.numeric(top_data$high_price_concentration) +
+    as.numeric(top_data$unusual_department_combination) +
+    as.numeric(top_data$slow_scan),
+    na.rm = TRUE
+  ) / 3
+
+  objective_value <-
+    0.35 * mean(top_data$if_score_01, na.rm = TRUE) +
+    0.30 * mean(top_data$graph_score_01, na.rm = TRUE) +
+    0.20 * mean(top_data$baseline_score_01, na.rm = TRUE) +
+    0.15 * rule_bonus -
+    0.03 * items_penalty -
+    0.03 * price_penalty
+
+  return(objective_value)
+}
+
+study <- optuna$create_study(direction = "maximize")
+study$optimize(objective, n_trials = as.integer(100))
+```
+
+
+```{r}
+study$best_params
+study$best_value
+```
+
+
+```{r}
+best_params <- study$best_params
+
+w_baseline <- best_params[["w_baseline"]]
+w_if <- best_params[["w_if"]]
+w_graph <- best_params[["w_graph"]]
+
+w_sum <- w_baseline + w_if + w_graph
+w_baseline <- w_baseline / w_sum
+w_if <- w_if / w_sum
+w_graph <- w_graph / w_sum
+
+top_k_best <- as.integer(best_params[["top_k"]])
+
+final_optuna_train <- baseline_train %>%
+  mutate(
+    optuna_score =
+      w_baseline * baseline_score_01 +
+      w_if * if_score_01 +
+      w_graph * graph_score_01
+  ) %>%
+  arrange(desc(optuna_score))
+
+top_optuna_train <- final_optuna_train %>%
+  slice_head(n = top_k_best)
+
+summary(top_optuna_train$if_score)
+summary(top_optuna_train$graph_score)
+summary(top_optuna_train$total_items)
+summary(top_optuna_train$total_price)
+```
+
+
+```{r}
+write.csv(
+  top_optuna_train,
+  "~/Desktop/supermarket case/test cases/top_optuna_train.csv",
+  row.names = FALSE
+)
+```
+
+# OPTUNA WEIGHTS SECOND TEST
+
+```{r}
+objective <- function(trial) {
+  w_baseline <- trial$suggest_float("w_baseline", 0.05, 0.45)
+  w_if       <- trial$suggest_float("w_if", 0.20, 0.70)
+  w_graph    <- trial$suggest_float("w_graph", 0.10, 0.50)
+
+  top_k <- as.integer(
+    trial$suggest_categorical("top_k", list(100L, 125L, 150L, 175L, 200L))
+  )
+
+  w_sum <- w_baseline + w_if + w_graph
+  w_baseline <- w_baseline / w_sum
+  w_if <- w_if / w_sum
+  w_graph <- w_graph / w_sum
+
+  scored <- baseline_train %>%
+    mutate(
+      optuna_score =
+        w_baseline * baseline_score_01 +
+        w_if * if_score_01 +
+        w_graph * graph_score_01
+    ) %>%
+    arrange(desc(optuna_score))
+
+  top_data <- scored %>%
+    slice_head(n = top_k)
+
+  mean_items <- mean(top_data$total_items, na.rm = TRUE)
+  mean_price <- mean(top_data$total_price, na.rm = TRUE)
+
+  median_items <- median(top_data$total_items, na.rm = TRUE)
+  median_price <- median(top_data$total_price, na.rm = TRUE)
+
+  items_penalty <- mean_items / max(baseline_train$total_items, na.rm = TRUE)
+  price_penalty <- mean_price / max(baseline_train$total_price, na.rm = TRUE)
+
+  rule_bonus <- mean(
+    as.numeric(top_data$high_price_concentration) +
+    as.numeric(top_data$unusual_department_combination) +
+    as.numeric(top_data$slow_scan),
+    na.rm = TRUE
+  ) / 3
+
+  collapse_penalty <- 0
+
+  if (median_items < 5) {
+    collapse_penalty <- collapse_penalty + 0.05
+  }
+
+  if (median_price < 15) {
+    collapse_penalty <- collapse_penalty + 0.05
+  }
+
+  objective_value <-
+    0.33 * mean(top_data$if_score_01, na.rm = TRUE) +
+    0.28 * mean(top_data$graph_score_01, na.rm = TRUE) +
+    0.24 * mean(top_data$baseline_score_01, na.rm = TRUE) +
+    0.15 * rule_bonus -
+    0.03 * items_penalty -
+    0.03 * price_penalty -
+    collapse_penalty
+
+  return(objective_value)
+}
+```
+
+```{r}
+study <- optuna$create_study(direction = "maximize")
+study$optimize(objective, n_trials = as.integer(100))
+```
+
+
+```{r}
+study$best_params
+study$best_value
+```
+
+
+```{r}
+best_params <- study$best_params
+
+w_baseline <- best_params[["w_baseline"]]
+w_if <- best_params[["w_if"]]
+w_graph <- best_params[["w_graph"]]
+
+w_sum <- w_baseline + w_if + w_graph
+w_baseline <- w_baseline / w_sum
+w_if <- w_if / w_sum
+w_graph <- w_graph / w_sum
+
+top_k_best <- as.integer(best_params[["top_k"]])
+
+final_optuna_train <- baseline_train %>%
+  mutate(
+    optuna_score =
+      w_baseline * baseline_score_01 +
+      w_if * if_score_01 +
+      w_graph * graph_score_01
+  ) %>%
+  arrange(desc(optuna_score))
+
+top_optuna_train <- final_optuna_train %>%
+  slice_head(n = top_k_best)
+
+summary(top_optuna_train$if_score)
+summary(top_optuna_train$graph_score)
+summary(top_optuna_train$total_items)
+summary(top_optuna_train$total_price)
+
+write.csv(
+  top_optuna_train,
+  "~/Desktop/supermarket case/test cases/top_optuna_train_v2.csv",
+  row.names = FALSE
+)
+```
+# OPTUNA 3RD TEST
+
+```{r}
+objective <- function(trial) {
+  w_baseline <- trial$suggest_float("w_baseline", 0.05, 0.50)
+  w_if       <- trial$suggest_float("w_if", 0.15, 0.70)
+  w_graph    <- trial$suggest_float("w_graph", 0.10, 0.50)
+
+top_k <- 150L
+
+  w_sum <- w_baseline + w_if + w_graph
+  w_baseline <- w_baseline / w_sum
+  w_if <- w_if / w_sum
+  w_graph <- w_graph / w_sum
+
+  scored <- baseline_train %>%
+    mutate(
+      optuna_score =
+        w_baseline * baseline_score_01 +
+        w_if * if_score_01 +
+        w_graph * graph_score_01
+    ) %>%
+    arrange(desc(optuna_score))
+
+  top_data <- scored %>%
+    slice_head(n = top_k)
+
+  mean_items <- mean(top_data$total_items, na.rm = TRUE)
+  mean_price <- mean(top_data$total_price, na.rm = TRUE)
+
+  median_items <- median(top_data$total_items, na.rm = TRUE)
+  median_price <- median(top_data$total_price, na.rm = TRUE)
+
+  # hard constraints
+  if (median_items < 5) {
+    return(-999)
+  }
+
+  if (median_price < 15) {
+    return(-999)
+  }
+
+  if (mean_items < 6) {
+    return(-999)
+  }
+
+  if (mean_price < 18) {
+    return(-999)
+  }
+
+  items_penalty <- mean_items / max(baseline_train$total_items, na.rm = TRUE)
+  price_penalty <- mean_price / max(baseline_train$total_price, na.rm = TRUE)
+
+  rule_bonus <- mean(
+    as.numeric(top_data$high_price_concentration) +
+    as.numeric(top_data$unusual_department_combination) +
+    as.numeric(top_data$slow_scan),
+    na.rm = TRUE
+  ) / 3
+
+  objective_value <-
+    0.32 * mean(top_data$if_score_01, na.rm = TRUE) +
+    0.26 * mean(top_data$graph_score_01, na.rm = TRUE) +
+    0.27 * mean(top_data$baseline_score_01, na.rm = TRUE) +
+    0.15 * rule_bonus -
+    0.02 * items_penalty -
+    0.02 * price_penalty
+
+  return(objective_value)
+}
+```
+
+
+```{r}
+study <- optuna$create_study(direction = "maximize")
+study$optimize(objective, n_trials = as.integer(150))
+```
+
+
+```{r}
+study$best_params
+study$best_value
+```
+
+```{r}
+ best_params <- study$best_params
+
+w_baseline <- best_params[["w_baseline"]]
+w_if <- best_params[["w_if"]]
+w_graph <- best_params[["w_graph"]]
+
+w_sum <- w_baseline + w_if + w_graph
+w_baseline <- w_baseline / w_sum
+w_if <- w_if / w_sum
+w_graph <- w_graph / w_sum
+
+top_k_best <- 150L
+
+final_optuna_train <- baseline_train %>%
+  mutate(
+    optuna_score =
+      w_baseline * baseline_score_01 +
+      w_if * if_score_01 +
+      w_graph * graph_score_01
+  ) %>%
+  arrange(desc(optuna_score))
+
+top_optuna_train <- final_optuna_train %>%
+  slice_head(n = top_k_best)
+
+summary(top_optuna_train$if_score)
+summary(top_optuna_train$graph_score)
+summary(top_optuna_train$total_items)
+summary(top_optuna_train$total_price)
+
+write.csv(
+  top_optuna_train,
+  "~/Desktop/supermarket case/test cases/top_optuna_train_v3.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+
+```

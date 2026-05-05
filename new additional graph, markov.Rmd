@@ -1,0 +1,592 @@
+---
+title: "cashier department"
+output: pdf_document
+date: "2026-05-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(tidyverse)
+
+# 1. CASHIER TRAIN DATA
+
+lines_cashier <- readLines("~/Desktop/supermarket case/cashier_data.csv", warn = FALSE)
+
+cashier_raw <- tibble(
+  transaction_id = 1:length(lines_cashier),
+  basket = lines_cashier
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+cashier_long <- cashier_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(price),
+    !is.na(department_name),
+    price >= 0
+  )
+
+# basket-level cashier table
+cashier_basket <- cashier_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# 2. CASHIER GRAPH TRAIN
+
+cashier_dept_data <- cashier_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+cashier_pairs <- cashier_dept_data %>%
+  inner_join(cashier_dept_data, by = "transaction_id", relationship = "many-to-many") %>%
+  filter(department_name.x < department_name.y) %>%
+  transmute(
+    transaction_id,
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+cashier_dept_counts <- cashier_dept_data %>%
+  count(department_name, name = "dept_count")
+
+cashier_pair_counts <- cashier_pairs %>%
+  count(dept_1, dept_2, name = "pair_count")
+
+cashier_pair_conditional <- cashier_pair_counts %>%
+  left_join(
+    cashier_dept_counts %>% rename(dept_1 = department_name, dept_1_count = dept_count),
+    by = "dept_1"
+  ) %>%
+  left_join(
+    cashier_dept_counts %>% rename(dept_2 = department_name, dept_2_count = dept_count),
+    by = "dept_2"
+  ) %>%
+  mutate(
+    p_2_given_1 = pair_count / dept_1_count,
+    p_1_given_2 = pair_count / dept_2_count,
+    conditional_strength = (p_2_given_1 + p_1_given_2) / 2,
+    conditional_rarity = -log(conditional_strength)
+  )
+
+cashier_graph_train <- cashier_pairs %>%
+  left_join(
+    cashier_pair_conditional %>%
+      select(dept_1, dept_2, conditional_strength, conditional_rarity),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    cashier_graph_score = mean(conditional_rarity, na.rm = TRUE),
+    cashier_avg_conditional_strength = mean(conditional_strength, na.rm = TRUE),
+    cashier_n_pairs = n(),
+    .groups = "drop"
+  )
+
+# 3. CASHIER MARKOV TRAIN
+
+cashier_transitions <- cashier_long %>%
+  arrange(transaction_id, item_order) %>%
+  group_by(transaction_id) %>%
+  mutate(next_department = lead(department_name)) %>%
+  ungroup() %>%
+  filter(!is.na(next_department)) %>%
+  select(
+    transaction_id,
+    from_dept = department_name,
+    to_dept = next_department
+  )
+
+cashier_transition_counts <- cashier_transitions %>%
+  count(from_dept, to_dept, name = "transition_count")
+
+cashier_from_counts <- cashier_transitions %>%
+  count(from_dept, name = "from_count")
+
+cashier_transition_probs <- cashier_transition_counts %>%
+  left_join(cashier_from_counts, by = "from_dept") %>%
+  mutate(
+    transition_prob = transition_count / from_count,
+    transition_neglog = -log(transition_prob)
+  )
+
+cashier_markov_train <- cashier_transitions %>%
+  left_join(
+    cashier_transition_probs %>%
+      select(from_dept, to_dept, transition_prob, transition_neglog),
+    by = c("from_dept", "to_dept")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    cashier_markov_score = mean(transition_neglog, na.rm = TRUE),
+    cashier_avg_transition_prob = mean(transition_prob, na.rm = TRUE),
+    cashier_n_transitions = n(),
+    .groups = "drop"
+  )
+
+# optional: top cashier anomalies relative to cashier norm
+cashier_combo_train <- cashier_basket %>%
+  left_join(cashier_graph_train, by = "transaction_id") %>%
+  left_join(cashier_markov_train, by = "transaction_id") %>%
+  mutate(
+    cashier_graph_score = replace_na(cashier_graph_score, 0),
+    cashier_markov_score = replace_na(cashier_markov_score, 0),
+    cashier_graph_score_01 = percent_rank(cashier_graph_score),
+    cashier_markov_score_01 = percent_rank(cashier_markov_score),
+    cashier_graph_markov_score =
+      0.5 * cashier_graph_score_01 +
+      0.5 * cashier_markov_score_01
+  ) %>%
+  arrange(desc(cashier_graph_markov_score))
+
+top_150_cashier_graph_markov_train <- cashier_combo_train %>%
+  slice_head(n = 150)
+
+write.csv(
+  top_150_cashier_graph_markov_train,
+  "~/Desktop/top_150_cashier_graph_markov_train.csv",
+  row.names = FALSE
+)
+
+# 4. SUPERMARKET DATA TO SCORE
+
+lines_supermarket <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines_supermarket),
+  basket = lines_supermarket
+)
+
+supermarket_long <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+supermarket_basket <- supermarket_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# 5. APPLY CASHIER GRAPH TO SUPERMARKET
+
+supermarket_dept_data <- supermarket_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+supermarket_pairs <- supermarket_dept_data %>%
+  inner_join(supermarket_dept_data, by = "transaction_id", relationship = "many-to-many") %>%
+  filter(department_name.x < department_name.y) %>%
+  transmute(
+    transaction_id,
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+supermarket_graph_from_cashier <- supermarket_pairs %>%
+  left_join(
+    cashier_pair_conditional %>%
+      select(dept_1, dept_2, conditional_strength, conditional_rarity),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    cashier_graph_score = mean(conditional_rarity, na.rm = TRUE),
+    cashier_avg_conditional_strength = mean(conditional_strength, na.rm = TRUE),
+    cashier_n_pairs = n(),
+    .groups = "drop"
+  )
+
+# 6. APPLY CASHIER MARKOV TO SUPERMARKET
+
+supermarket_transitions <- supermarket_long %>%
+  arrange(transaction_id, item_order) %>%
+  group_by(transaction_id) %>%
+  mutate(next_department = lead(department_name)) %>%
+  ungroup() %>%
+  filter(!is.na(next_department)) %>%
+  select(
+    transaction_id,
+    from_dept = department_name,
+    to_dept = next_department
+  )
+
+supermarket_markov_from_cashier <- supermarket_transitions %>%
+  left_join(
+    cashier_transition_probs %>%
+      select(from_dept, to_dept, transition_prob, transition_neglog),
+    by = c("from_dept", "to_dept")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    cashier_markov_score = mean(transition_neglog, na.rm = TRUE),
+    cashier_avg_transition_prob = mean(transition_prob, na.rm = TRUE),
+    cashier_n_transitions = n(),
+    .groups = "drop"
+  )
+
+# 7. FINAL CASHIER GRAPH + MARKOV SCORE
+
+supermarket_cashier_combo <- supermarket_basket %>%
+  left_join(supermarket_graph_from_cashier, by = "transaction_id") %>%
+  left_join(supermarket_markov_from_cashier, by = "transaction_id") %>%
+  mutate(
+    cashier_graph_score = replace_na(cashier_graph_score, 0),
+    cashier_markov_score = replace_na(cashier_markov_score, 0),
+    cashier_graph_score_01 = percent_rank(cashier_graph_score),
+    cashier_markov_score_01 = percent_rank(cashier_markov_score),
+    cashier_graph_markov_score =
+      0.5 * cashier_graph_score_01 +
+      0.5 * cashier_markov_score_01
+  ) %>%
+  arrange(desc(cashier_graph_markov_score))
+
+top_150_supermarket_from_cashier_graph_markov <- supermarket_cashier_combo %>%
+  slice_head(n = 150)
+
+write.csv(
+  top_150_supermarket_from_cashier_graph_markov,
+  "~/Desktop/top_150_supermarket_from_cashier_graph_markov.csv",
+  row.names = FALSE
+)
+```
+
+
+
+
+```{r}
+library(tidyverse)
+
+lines_cashier <- readLines("~/Desktop/supermarket case/cashier_data.csv", warn = FALSE)
+
+cashier_raw <- tibble(
+  transaction_id = 1:length(lines_cashier),
+  basket = lines_cashier
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+cashier_long <- cashier_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(price),
+    !is.na(department_name),
+    price >= 0
+  )
+
+cashier_basket <- cashier_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# 2. CASHIER GRAPH TRAIN
+
+cashier_dept_data <- cashier_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+cashier_pairs <- cashier_dept_data %>%
+  inner_join(cashier_dept_data, by = "transaction_id", relationship = "many-to-many") %>%
+  filter(department_name.x < department_name.y) %>%
+  transmute(
+    transaction_id,
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+cashier_dept_counts <- cashier_dept_data %>%
+  count(department_name, name = "dept_count")
+
+cashier_pair_counts <- cashier_pairs %>%
+  count(dept_1, dept_2, name = "pair_count")
+
+cashier_pair_conditional <- cashier_pair_counts %>%
+  left_join(
+    cashier_dept_counts %>% rename(dept_1 = department_name, dept_1_count = dept_count),
+    by = "dept_1"
+  ) %>%
+  left_join(
+    cashier_dept_counts %>% rename(dept_2 = department_name, dept_2_count = dept_count),
+    by = "dept_2"
+  ) %>%
+  mutate(
+    p_2_given_1 = pair_count / dept_1_count,
+    p_1_given_2 = pair_count / dept_2_count,
+    conditional_strength = (p_2_given_1 + p_1_given_2) / 2,
+    conditional_rarity = -log(conditional_strength)
+  )
+
+cashier_graph_train <- cashier_pairs %>%
+  left_join(
+    cashier_pair_conditional %>%
+      select(dept_1, dept_2, conditional_strength, conditional_rarity),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    cashier_graph_score = mean(conditional_rarity, na.rm = TRUE),
+    cashier_avg_conditional_strength = mean(conditional_strength, na.rm = TRUE),
+    cashier_n_pairs = n(),
+    .groups = "drop"
+  )
+
+top_150_cashier_graph_train <- cashier_basket %>%
+  left_join(cashier_graph_train, by = "transaction_id") %>%
+  mutate(
+    cashier_graph_score = replace_na(cashier_graph_score, 0),
+    cashier_avg_conditional_strength = replace_na(cashier_avg_conditional_strength, 0),
+    cashier_n_pairs = replace_na(cashier_n_pairs, 0)
+  ) %>%
+  arrange(desc(cashier_graph_score)) %>%
+  slice_head(n = 150)
+
+write.csv(
+  top_150_cashier_graph_train,
+  "~/Desktop/top_150_cashier_graph_train.csv",
+  row.names = FALSE
+)
+
+# 3. SUPERMARKET DATA
+
+lines_supermarket <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines_supermarket),
+  basket = lines_supermarket
+)
+
+supermarket_long <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+supermarket_basket <- supermarket_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# 4. APPLY CASHIER GRAPH TO SUPERMARKET
+
+supermarket_dept_data <- supermarket_long %>%
+  select(transaction_id, department_name) %>%
+  distinct()
+
+supermarket_pairs <- supermarket_dept_data %>%
+  inner_join(supermarket_dept_data, by = "transaction_id", relationship = "many-to-many") %>%
+  filter(department_name.x < department_name.y) %>%
+  transmute(
+    transaction_id,
+    dept_1 = department_name.x,
+    dept_2 = department_name.y
+  )
+
+supermarket_graph_from_cashier <- supermarket_pairs %>%
+  left_join(
+    cashier_pair_conditional %>%
+      select(dept_1, dept_2, conditional_strength, conditional_rarity),
+    by = c("dept_1", "dept_2")
+  ) %>%
+  group_by(transaction_id) %>%
+  summarise(
+    cashier_graph_score = mean(conditional_rarity, na.rm = TRUE),
+    cashier_avg_conditional_strength = mean(conditional_strength, na.rm = TRUE),
+    cashier_n_pairs = n(),
+    .groups = "drop"
+  )
+
+supermarket_from_cashier_graph <- supermarket_basket %>%
+  left_join(supermarket_graph_from_cashier, by = "transaction_id") %>%
+  mutate(
+    cashier_graph_score = replace_na(cashier_graph_score, 0),
+    cashier_avg_conditional_strength = replace_na(cashier_avg_conditional_strength, 0),
+    cashier_n_pairs = replace_na(cashier_n_pairs, 0),
+    cashier_graph_score_01 = percent_rank(cashier_graph_score)
+  ) %>%
+  arrange(desc(cashier_graph_score))
+
+top_150_supermarket_from_cashier_graph <- supermarket_from_cashier_graph %>%
+  slice_head(n = 150)
+
+top_150_supermarket_from_cashier_graph %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    unique_departments,
+    cashier_graph_score,
+    cashier_avg_conditional_strength,
+    cashier_n_pairs
+  ) %>%
+  head(20)
+
+write.csv(
+  top_150_supermarket_from_cashier_graph,
+  "~/Desktop/top_150_supermarket_from_cashier_graph.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+summary(top_150_supermarket_from_cashier_graph$total_items)
+summary(top_150_supermarket_from_cashier_graph$total_price)
+summary(top_150_supermarket_from_cashier_graph$cashier_graph_score)
+```
+
+```{r}
+
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+

@@ -1,0 +1,1095 @@
+---
+title: "Untitled"
+output: pdf_document
+date: "2026-05-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+1. PRICE + DEPARTMENT + SHRINKAGE + STOCKTAKE CLUSTERING
+
+```{r}
+library(tidyverse)
+
+# TRAIN: PRICE + DEPARTMENT + SHRINKAGE + STOCKTAKE CLUSTERING
+# new business-grounded clustering space
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- long_data %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments
+  )
+
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+# SHRINKAGE RISK
+
+shrinkage <- read.csv(
+  "~/Desktop/supermarket case/shrinkage.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    items_expected = as.numeric(items_expected),
+    revenue_expected = as.numeric(revenue_expected),
+    items_lost = as.numeric(items_lost),
+    revenue_lost = as.numeric(revenue_lost)
+  ) %>%
+  filter(!is.na(department))
+
+shrinkage_profile <- shrinkage %>%
+  mutate(
+    item_loss_rate = ifelse(items_expected > 0, items_lost / items_expected, NA_real_),
+    revenue_loss_rate = ifelse(revenue_expected > 0, revenue_lost / revenue_expected, NA_real_)
+  ) %>%
+  mutate(
+    shrinkage_risk =
+      0.35 * percent_rank(items_lost) +
+      0.35 * percent_rank(revenue_lost) +
+      0.15 * percent_rank(item_loss_rate) +
+      0.15 * percent_rank(revenue_loss_rate)
+  ) %>%
+  select(
+    department,
+    items_lost,
+    revenue_lost,
+    item_loss_rate,
+    revenue_loss_rate,
+    shrinkage_risk
+  )
+
+# STOCKTAKE RISK
+
+stocktake <- read.csv(
+  "~/Desktop/supermarket case/stocktake_missing.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    item_value = as.numeric(item_value)
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(item_value),
+    item_value >= 0
+  )
+
+stocktake_profile <- stocktake %>%
+  group_by(department) %>%
+  summarise(
+    stocktake_count = n(),
+    stocktake_mean_value = mean(item_value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    stocktake_risk =
+      0.50 * percent_rank(stocktake_count) +
+      0.50 * percent_rank(stocktake_mean_value)
+  )
+
+# ITEM-LEVEL RISK ENRICHMENT
+
+long_risk <- long_data %>%
+  left_join(
+    shrinkage_profile %>% select(department, shrinkage_risk),
+    by = "department"
+  ) %>%
+  left_join(
+    stocktake_profile %>% select(department, stocktake_risk),
+    by = "department"
+  ) %>%
+  mutate(
+    shrinkage_risk = replace_na(shrinkage_risk, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk = replace_na(stocktake_risk, median(stocktake_profile$stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_flag = shrinkage_risk >= quantile(shrinkage_risk, 0.75, na.rm = TRUE),
+    high_stocktake_flag = stocktake_risk >= quantile(stocktake_risk, 0.75, na.rm = TRUE)
+  )
+
+risk_features <- long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    avg_shrinkage_risk = mean(shrinkage_risk, na.rm = TRUE),
+    value_weighted_shrinkage_risk = ifelse(sum(price, na.rm = TRUE) > 0,
+                                           sum(price * shrinkage_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                           NA_real_),
+    avg_stocktake_risk = mean(stocktake_risk, na.rm = TRUE),
+    value_weighted_stocktake_risk = ifelse(sum(price, na.rm = TRUE) > 0,
+                                           sum(price * stocktake_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                           NA_real_),
+    high_shrinkage_value_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                                        sum(ifelse(high_shrinkage_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                        NA_real_),
+    high_stocktake_value_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                                        sum(ifelse(high_stocktake_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                        NA_real_),
+    .groups = "drop"
+  )
+
+cluster_train_risk <- basket_data %>%
+  left_join(risk_features, by = "transaction_id") %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    items_per_department,
+    price_deviation,
+    avg_shrinkage_risk,
+    value_weighted_shrinkage_risk,
+    avg_stocktake_risk,
+    value_weighted_stocktake_risk,
+    high_shrinkage_value_share,
+    high_stocktake_value_share
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(
+    sd_price = replace_na(sd_price, median(sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(dominant_department_share, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(items_per_department, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE)),
+    avg_shrinkage_risk = replace_na(avg_shrinkage_risk, median(avg_shrinkage_risk, na.rm = TRUE)),
+    value_weighted_shrinkage_risk = replace_na(value_weighted_shrinkage_risk, median(value_weighted_shrinkage_risk, na.rm = TRUE)),
+    avg_stocktake_risk = replace_na(avg_stocktake_risk, median(avg_stocktake_risk, na.rm = TRUE)),
+    value_weighted_stocktake_risk = replace_na(value_weighted_stocktake_risk, median(value_weighted_stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, median(high_shrinkage_value_share, na.rm = TRUE)),
+    high_stocktake_value_share = replace_na(high_stocktake_value_share, median(high_stocktake_value_share, na.rm = TRUE))
+  )
+
+
+X_cluster_risk_raw <- cluster_train_risk %>%
+  select(-transaction_id)
+
+# 1. Сначала убираем Inf / NaN
+X_cluster_risk_raw <- X_cluster_risk_raw %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+
+# 2. Заполняем все оставшиеся NA медианой колонки
+X_cluster_risk_raw <- X_cluster_risk_raw %>%
+  mutate(across(everything(), ~ replace_na(.x, median(.x, na.rm = TRUE))))
+
+# 3. Убираем константные колонки, где нет разброса
+keep_cols <- sapply(X_cluster_risk_raw, function(x) sd(x, na.rm = TRUE) > 0)
+
+X_cluster_risk_raw <- X_cluster_risk_raw[, keep_cols]
+
+# 4. Масштабируем
+X_cluster_risk <- scale(X_cluster_risk_raw)
+
+# 5. На всякий случай проверяем
+sum(!is.finite(X_cluster_risk))
+
+set.seed(123)
+kmeans_model_risk <- kmeans(
+  X_cluster_risk,
+  centers = 8,
+  nstart = 20,
+  iter.max = 100
+)
+
+cluster_train_risk$cluster_id <- kmeans_model_risk$cluster
+centers_risk <- kmeans_model_risk$centers
+
+cluster_train_risk$distance_to_centroid <- map2_dbl(
+  split(as.data.frame(X_cluster_risk), seq_len(nrow(X_cluster_risk))),
+  kmeans_model_risk$cluster,
+  ~ {
+    row_vec <- as.numeric(.x[1, ])
+    center_vec <- centers_risk[.y, ]
+    sqrt(sum((row_vec - center_vec)^2))
+  }
+)
+
+cluster_sizes_risk <- table(kmeans_model_risk$cluster)
+
+cluster_train_risk <- cluster_train_risk %>%
+  mutate(
+    cluster_size = as.numeric(cluster_sizes_risk[as.character(cluster_id)])
+  )
+
+top_150_kmeans_risk_train <- basket_data %>%
+  left_join(
+    cluster_train_risk %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  left_join(
+    risk_features,
+    by = "transaction_id"
+  ) %>%
+  arrange(desc(distance_to_centroid)) %>%
+  slice_head(n = 150)
+
+summary(top_150_kmeans_risk_train$total_items)
+summary(top_150_kmeans_risk_train$total_price)
+summary(top_150_kmeans_risk_train$avg_price)
+summary(top_150_kmeans_risk_train$price_deviation)
+summary(top_150_kmeans_risk_train$avg_shrinkage_risk)
+summary(top_150_kmeans_risk_train$avg_stocktake_risk)
+summary(top_150_kmeans_risk_train$distance_to_centroid)
+summary(top_150_kmeans_risk_train$cluster_size)
+
+write.csv(
+  top_150_kmeans_risk_train,
+  "~/Desktop/top_150_kmeans_risk_train.csv",
+  row.names = FALSE
+)
+```
+# CASE35: PRICE + DEPARTMENT + SHRINKAGE + STOCKTAKE CLUSTERING on avgs
+
+```{r}
+library(tidyverse)
+
+# current full risk version
+
+case35_lines <- readLines("~/Desktop/case35.csv", warn = FALSE)
+
+case35_raw <- tibble(
+  raw_line = case35_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case35_long <- case35_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case35_basket <- case35_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+case35_dept_share <- case35_long %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+case35_basket <- case35_basket %>%
+  left_join(case35_dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments,
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+case35_long_risk <- case35_long %>%
+  left_join(
+    shrinkage_profile %>% select(department, shrinkage_risk),
+    by = "department"
+  ) %>%
+  left_join(
+    stocktake_profile %>% select(department, stocktake_risk),
+    by = "department"
+  ) %>%
+  mutate(
+    shrinkage_risk = replace_na(shrinkage_risk, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk = replace_na(stocktake_risk, median(stocktake_profile$stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_flag = shrinkage_risk >= quantile(shrinkage_profile$shrinkage_risk, 0.75, na.rm = TRUE),
+    high_stocktake_flag = stocktake_risk >= quantile(stocktake_profile$stocktake_risk, 0.75, na.rm = TRUE)
+  )
+
+case35_risk_features <- case35_long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    avg_shrinkage_risk = mean(shrinkage_risk, na.rm = TRUE),
+    value_weighted_shrinkage_risk = ifelse(sum(price, na.rm = TRUE) > 0,
+                                           sum(price * shrinkage_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                           NA_real_),
+    avg_stocktake_risk = mean(stocktake_risk, na.rm = TRUE),
+    value_weighted_stocktake_risk = ifelse(sum(price, na.rm = TRUE) > 0,
+                                           sum(price * stocktake_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                           NA_real_),
+    high_shrinkage_value_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                                        sum(ifelse(high_shrinkage_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                        NA_real_),
+    high_stocktake_value_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                                        sum(ifelse(high_stocktake_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                        NA_real_),
+    .groups = "drop"
+  )
+
+cluster_case35 <- case35_basket %>%
+  left_join(case35_risk_features, by = "transaction_id") %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    items_per_department,
+    price_deviation,
+    avg_shrinkage_risk,
+    value_weighted_shrinkage_risk,
+    avg_stocktake_risk,
+    value_weighted_stocktake_risk,
+    high_shrinkage_value_share,
+    high_stocktake_value_share
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(
+    sd_price = replace_na(sd_price, median(cluster_train_risk$sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(cluster_train_risk$max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(cluster_train_risk$top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(cluster_train_risk$dominant_department_share, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(cluster_train_risk$items_per_department, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(cluster_train_risk$price_deviation, na.rm = TRUE)),
+    avg_shrinkage_risk = replace_na(avg_shrinkage_risk, median(cluster_train_risk$avg_shrinkage_risk, na.rm = TRUE)),
+    value_weighted_shrinkage_risk = replace_na(value_weighted_shrinkage_risk, median(cluster_train_risk$value_weighted_shrinkage_risk, na.rm = TRUE)),
+    avg_stocktake_risk = replace_na(avg_stocktake_risk, median(cluster_train_risk$avg_stocktake_risk, na.rm = TRUE)),
+    value_weighted_stocktake_risk = replace_na(value_weighted_stocktake_risk, median(cluster_train_risk$value_weighted_stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, median(cluster_train_risk$high_shrinkage_value_share, na.rm = TRUE)),
+    high_stocktake_value_share = replace_na(high_stocktake_value_share, median(cluster_train_risk$high_stocktake_value_share, na.rm = TRUE))
+  )
+
+X_case35_raw <- cluster_case35 %>%
+  select(-transaction_id)
+
+X_case35_raw <- X_case35_raw %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(across(everything(), ~ replace_na(.x, median(.x, na.rm = TRUE))))
+
+keep_cols <- sapply(X_case35_raw, function(x) sd(x, na.rm = TRUE) > 0)
+X_case35_raw <- X_case35_raw[, keep_cols]
+
+X_case35 <- scale(
+  X_case35_raw,
+  center = attr(X_cluster_risk, "scaled:center")[colnames(X_case35_raw)],
+  scale = attr(X_cluster_risk, "scaled:scale")[colnames(X_case35_raw)]
+)
+
+case35_clusters <- apply(X_case35, 1, function(row_vec) {
+  dists <- apply(centers_risk[, colnames(X_case35_raw), drop = FALSE], 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  which.min(dists)
+})
+
+case35_distances <- apply(X_case35, 1, function(row_vec) {
+  dists <- apply(centers_risk[, colnames(X_case35_raw), drop = FALSE], 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  min(dists)
+})
+
+cluster_case35$cluster_id <- case35_clusters
+cluster_case35$cluster_size <- as.numeric(cluster_sizes_risk[as.character(case35_clusters)])
+cluster_case35$distance_to_centroid <- case35_distances
+
+top_150_kmeans_risk_case35 <- case35_basket %>%
+  left_join(
+    cluster_case35 %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  left_join(case35_risk_features, by = "transaction_id") %>%
+  arrange(desc(distance_to_centroid)) %>%
+  slice_head(n = 150)
+
+summary(top_150_kmeans_risk_case35$total_items)
+summary(top_150_kmeans_risk_case35$total_price)
+summary(top_150_kmeans_risk_case35$avg_price)
+summary(top_150_kmeans_risk_case35$price_deviation)
+summary(top_150_kmeans_risk_case35$avg_shrinkage_risk)
+summary(top_150_kmeans_risk_case35$avg_stocktake_risk)
+summary(top_150_kmeans_risk_case35$distance_to_centroid)
+summary(top_150_kmeans_risk_case35$cluster_size)
+
+writeLines(as.character(top_150_kmeans_risk_case35$transaction_id))
+
+write.csv(
+  top_150_kmeans_risk_case35,
+  "~/Desktop/top_150_kmeans_risk_case35.csv",
+  row.names = FALSE
+)
+```
+
+# Compact value-weighted risk clustering v2
+
+```{r}
+library(tidyverse)
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+dept_share <- long_data %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+basket_data <- basket_data %>%
+  left_join(dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments
+  )
+
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+# SHRINKAGE RISK
+
+shrinkage <- read.csv(
+  "~/Desktop/supermarket case/shrinkage.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    items_expected = as.numeric(items_expected),
+    revenue_expected = as.numeric(revenue_expected),
+    items_lost = as.numeric(items_lost),
+    revenue_lost = as.numeric(revenue_lost)
+  ) %>%
+  filter(!is.na(department))
+
+shrinkage_profile <- shrinkage %>%
+  mutate(
+    item_loss_rate = ifelse(items_expected > 0, items_lost / items_expected, NA_real_),
+    revenue_loss_rate = ifelse(revenue_expected > 0, revenue_lost / revenue_expected, NA_real_)
+  ) %>%
+  mutate(
+    shrinkage_risk =
+      0.35 * percent_rank(items_lost) +
+      0.35 * percent_rank(revenue_lost) +
+      0.15 * percent_rank(item_loss_rate) +
+      0.15 * percent_rank(revenue_loss_rate)
+  ) %>%
+  select(
+    department,
+    items_lost,
+    revenue_lost,
+    item_loss_rate,
+    revenue_loss_rate,
+    shrinkage_risk
+  )
+
+# STOCKTAKE RISK
+
+
+stocktake <- read.csv(
+  "~/Desktop/supermarket case/stocktake_missing.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    department = as.integer(department),
+    item_value = as.numeric(item_value)
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(item_value),
+    item_value >= 0
+  )
+
+stocktake_profile <- stocktake %>%
+  group_by(department) %>%
+  summarise(
+    stocktake_count = n(),
+    stocktake_mean_value = mean(item_value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    stocktake_risk =
+      0.50 * percent_rank(stocktake_count) +
+      0.50 * percent_rank(stocktake_mean_value)
+  )
+
+
+# ITEM-LEVEL RISK ENRICHMENT
+
+long_risk <- long_data %>%
+  left_join(
+    shrinkage_profile %>% select(department, shrinkage_risk),
+    by = "department"
+  ) %>%
+  left_join(
+    stocktake_profile %>% select(department, stocktake_risk),
+    by = "department"
+  ) %>%
+  mutate(
+    shrinkage_risk = replace_na(shrinkage_risk, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk = replace_na(stocktake_risk, median(stocktake_profile$stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_flag = shrinkage_risk >= quantile(shrinkage_profile$shrinkage_risk, 0.75, na.rm = TRUE),
+    high_stocktake_flag = stocktake_risk >= quantile(stocktake_profile$stocktake_risk, 0.75, na.rm = TRUE)
+  )
+
+risk_features <- long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    value_weighted_shrinkage_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * shrinkage_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    value_weighted_stocktake_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * stocktake_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_shrinkage_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(high_shrinkage_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_stocktake_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(high_stocktake_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+cluster_train_risk_v2 <- basket_data %>%
+  left_join(risk_features, by = "transaction_id") %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    items_per_department,
+    price_deviation,
+    value_weighted_shrinkage_risk,
+    value_weighted_stocktake_risk,
+    high_shrinkage_value_share,
+    high_stocktake_value_share
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(
+    sd_price = replace_na(sd_price, median(sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(dominant_department_share, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(items_per_department, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE)),
+    value_weighted_shrinkage_risk = replace_na(value_weighted_shrinkage_risk, median(value_weighted_shrinkage_risk, na.rm = TRUE)),
+    value_weighted_stocktake_risk = replace_na(value_weighted_stocktake_risk, median(value_weighted_stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, median(high_shrinkage_value_share, na.rm = TRUE)),
+    high_stocktake_value_share = replace_na(high_stocktake_value_share, median(high_stocktake_value_share, na.rm = TRUE))
+  )
+
+X_cluster_risk_v2_raw <- cluster_train_risk_v2 %>%
+  select(-transaction_id) %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(across(everything(), ~ replace_na(.x, median(.x, na.rm = TRUE))))
+
+keep_cols_v2 <- sapply(X_cluster_risk_v2_raw, function(x) sd(x, na.rm = TRUE) > 0)
+X_cluster_risk_v2_raw <- X_cluster_risk_v2_raw[, keep_cols_v2]
+
+X_cluster_risk_v2 <- scale(X_cluster_risk_v2_raw)
+
+set.seed(123)
+kmeans_model_risk_v2 <- kmeans(
+  as.matrix(X_cluster_risk_v2),
+  centers = 8,
+  nstart = 20,
+  iter.max = 100,
+  algorithm = "Lloyd"
+)
+
+cluster_train_risk_v2$cluster_id <- kmeans_model_risk_v2$cluster
+centers_risk_v2 <- kmeans_model_risk_v2$centers
+
+cluster_train_risk_v2$distance_to_centroid <- map2_dbl(
+  split(as.data.frame(X_cluster_risk_v2), seq_len(nrow(X_cluster_risk_v2))),
+  kmeans_model_risk_v2$cluster,
+  ~ {
+    row_vec <- as.numeric(.x[1, ])
+    center_vec <- centers_risk_v2[.y, ]
+    sqrt(sum((row_vec - center_vec)^2))
+  }
+)
+
+cluster_sizes_risk_v2 <- table(kmeans_model_risk_v2$cluster)
+
+cluster_train_risk_v2 <- cluster_train_risk_v2 %>%
+  mutate(
+    cluster_size = as.numeric(cluster_sizes_risk_v2[as.character(cluster_id)])
+  )
+
+top_150_kmeans_risk_v2_train <- basket_data %>%
+  left_join(
+    cluster_train_risk_v2 %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  left_join(risk_features, by = "transaction_id") %>%
+  arrange(desc(distance_to_centroid)) %>%
+  slice_head(n = 150)
+
+summary(top_150_kmeans_risk_v2_train$total_items)
+summary(top_150_kmeans_risk_v2_train$total_price)
+summary(top_150_kmeans_risk_v2_train$avg_price)
+summary(top_150_kmeans_risk_v2_train$price_deviation)
+summary(top_150_kmeans_risk_v2_train$value_weighted_shrinkage_risk)
+summary(top_150_kmeans_risk_v2_train$value_weighted_stocktake_risk)
+summary(top_150_kmeans_risk_v2_train$distance_to_centroid)
+summary(top_150_kmeans_risk_v2_train$cluster_size)
+
+write.csv(
+  top_150_kmeans_risk_v2_train,
+  "~/Desktop/top_150_kmeans_risk_v2_train.csv",
+  row.names = FALSE
+)
+```
+
+# CASE36: COMPACT VALUE-WEIGHTED RISK CLUSTERING V2
+
+```{r}
+library(tidyverse)
+
+case36_lines <- readLines("~/Desktop/case36.csv", warn = FALSE)
+
+case36_raw <- tibble(
+  raw_line = case36_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case36_long <- case36_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case36_basket <- case36_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    sd_price = sd(price, na.rm = TRUE),
+    max_price = max(price, na.rm = TRUE),
+    top_3_price_share = {
+      p <- sort(price, decreasing = TRUE)
+      if (sum(price, na.rm = TRUE) > 0) {
+        sum(head(p, 3), na.rm = TRUE) / sum(price, na.rm = TRUE)
+      } else {
+        NA_real_
+      }
+    },
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+  )
+
+case36_dept_share <- case36_long %>%
+  dplyr::count(transaction_id, department, name = "dept_items") %>%
+  group_by(transaction_id) %>%
+  summarise(
+    dominant_department_share = max(dept_items) / sum(dept_items),
+    .groups = "drop"
+  )
+
+case36_basket <- case36_basket %>%
+  left_join(case36_dept_share, by = "transaction_id") %>%
+  mutate(
+    items_per_department = total_items / unique_departments,
+    expected_price_given_items = predict(model_price, newdata = .),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+case36_long_risk <- case36_long %>%
+  left_join(
+    shrinkage_profile %>% select(department, shrinkage_risk),
+    by = "department"
+  ) %>%
+  left_join(
+    stocktake_profile %>% select(department, stocktake_risk),
+    by = "department"
+  ) %>%
+  mutate(
+    shrinkage_risk = replace_na(shrinkage_risk, median(shrinkage_profile$shrinkage_risk, na.rm = TRUE)),
+    stocktake_risk = replace_na(stocktake_risk, median(stocktake_profile$stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_flag = shrinkage_risk >= quantile(shrinkage_profile$shrinkage_risk, 0.75, na.rm = TRUE),
+    high_stocktake_flag = stocktake_risk >= quantile(stocktake_profile$stocktake_risk, 0.75, na.rm = TRUE)
+  )
+
+case36_risk_features <- case36_long_risk %>%
+  group_by(transaction_id) %>%
+  summarise(
+    value_weighted_shrinkage_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * shrinkage_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    value_weighted_stocktake_risk = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(price * stocktake_risk, na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_shrinkage_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(high_shrinkage_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    high_stocktake_value_share = ifelse(
+      sum(price, na.rm = TRUE) > 0,
+      sum(ifelse(high_stocktake_flag, price, 0), na.rm = TRUE) / sum(price, na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+cluster_case36_v2 <- case36_basket %>%
+  left_join(case36_risk_features, by = "transaction_id") %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    sd_price,
+    max_price_share,
+    top_3_price_share,
+    unique_departments,
+    dominant_department_share,
+    items_per_department,
+    price_deviation,
+    value_weighted_shrinkage_risk,
+    value_weighted_stocktake_risk,
+    high_shrinkage_value_share,
+    high_stocktake_value_share
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(
+    sd_price = replace_na(sd_price, median(cluster_train_risk_v2$sd_price, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(cluster_train_risk_v2$max_price_share, na.rm = TRUE)),
+    top_3_price_share = replace_na(top_3_price_share, median(cluster_train_risk_v2$top_3_price_share, na.rm = TRUE)),
+    dominant_department_share = replace_na(dominant_department_share, median(cluster_train_risk_v2$dominant_department_share, na.rm = TRUE)),
+    items_per_department = replace_na(items_per_department, median(cluster_train_risk_v2$items_per_department, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(cluster_train_risk_v2$price_deviation, na.rm = TRUE)),
+    value_weighted_shrinkage_risk = replace_na(value_weighted_shrinkage_risk, median(cluster_train_risk_v2$value_weighted_shrinkage_risk, na.rm = TRUE)),
+    value_weighted_stocktake_risk = replace_na(value_weighted_stocktake_risk, median(cluster_train_risk_v2$value_weighted_stocktake_risk, na.rm = TRUE)),
+    high_shrinkage_value_share = replace_na(high_shrinkage_value_share, median(cluster_train_risk_v2$high_shrinkage_value_share, na.rm = TRUE)),
+    high_stocktake_value_share = replace_na(high_stocktake_value_share, median(cluster_train_risk_v2$high_stocktake_value_share, na.rm = TRUE))
+  )
+
+X_case36_v2_raw <- cluster_case36_v2 %>%
+  select(-transaction_id) %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(across(everything(), ~ replace_na(.x, median(.x, na.rm = TRUE))))
+
+keep_cols_case36_v2 <- colnames(X_cluster_risk_v2_raw)
+X_case36_v2_raw <- X_case36_v2_raw[, keep_cols_case36_v2, drop = FALSE]
+
+X_case36_v2 <- scale(
+  X_case36_v2_raw,
+  center = attr(X_cluster_risk_v2, "scaled:center")[keep_cols_case36_v2],
+  scale = attr(X_cluster_risk_v2, "scaled:scale")[keep_cols_case36_v2]
+)
+
+case36_clusters_v2 <- apply(X_case36_v2, 1, function(row_vec) {
+  dists <- apply(centers_risk_v2[, keep_cols_case36_v2, drop = FALSE], 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  which.min(dists)
+})
+
+case36_distances_v2 <- apply(X_case36_v2, 1, function(row_vec) {
+  dists <- apply(centers_risk_v2[, keep_cols_case36_v2, drop = FALSE], 1, function(center_vec) {
+    sqrt(sum((row_vec - center_vec)^2))
+  })
+  min(dists)
+})
+
+cluster_case36_v2$cluster_id <- case36_clusters_v2
+cluster_case36_v2$cluster_size <- as.numeric(cluster_sizes_risk_v2[as.character(case36_clusters_v2)])
+cluster_case36_v2$distance_to_centroid <- case36_distances_v2
+
+top_150_kmeans_risk_v2_case36 <- case36_basket %>%
+  left_join(
+    cluster_case36_v2 %>%
+      select(transaction_id, cluster_id, cluster_size, distance_to_centroid),
+    by = "transaction_id"
+  ) %>%
+  left_join(case36_risk_features, by = "transaction_id") %>%
+  arrange(desc(distance_to_centroid)) %>%
+  slice_head(n = 150)
+
+summary(top_150_kmeans_risk_v2_case36$total_items)
+summary(top_150_kmeans_risk_v2_case36$total_price)
+summary(top_150_kmeans_risk_v2_case36$avg_price)
+summary(top_150_kmeans_risk_v2_case36$price_deviation)
+summary(top_150_kmeans_risk_v2_case36$value_weighted_shrinkage_risk)
+summary(top_150_kmeans_risk_v2_case36$value_weighted_stocktake_risk)
+summary(top_150_kmeans_risk_v2_case36$distance_to_centroid)
+summary(top_150_kmeans_risk_v2_case36$cluster_size)
+
+writeLines(as.character(top_150_kmeans_risk_v2_case36$transaction_id))
+
+write.csv(
+  top_150_kmeans_risk_v2_case36,
+  "~/Desktop/top_150_kmeans_risk_v2_case36.csv",
+  row.names = FALSE
+)
+```
+
+
+

@@ -1,0 +1,295 @@
+---
+title: "IF"
+output: pdf_document
+date: "2026-05-03"
+---
+
+# CASE 20
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(isotree)
+
+# IF1: COMPACT IF + price_deviation
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    price_per_second = ifelse(sum(time, na.rm = TRUE) > 0,
+                              sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+                              NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    max_price_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                             max(price, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                             NA_real_),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+model_price <- lm(total_price ~ total_items, data = basket_data)
+
+basket_data <- basket_data %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = basket_data),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+if_train_if1 <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    price_deviation
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(price_deviation, na.rm = TRUE))
+  )
+
+X_if1_raw <- if_train_if1 %>%
+  select(-transaction_id)
+
+X_if1 <- scale(X_if1_raw)
+
+if_model_if1 <- isolation.forest(
+  as.matrix(X_if1),
+  ntrees = 300,
+  sample_size = 512,
+  ndim = 1,
+  nthreads = 1
+)
+
+if_train_if1$if_score <- predict(
+  if_model_if1,
+  as.matrix(X_if1),
+  type = "score"
+)
+
+top_150_if_train_if1 <- if_train_if1 %>%
+  arrange(desc(if_score)) %>%
+  slice_head(n = 150)
+
+summary(top_150_if_train_if1$total_items)
+summary(top_150_if_train_if1$total_price)
+summary(top_150_if_train_if1$avg_time_per_item)
+summary(top_150_if_train_if1$price_deviation)
+summary(top_150_if_train_if1$if_score)
+
+write.csv(
+  top_150_if_train_if1,
+  "~/Desktop/top_150_if_train_if1.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# CASE20: IF1 = COMPACT IF + price_deviation
+
+library(tidyverse)
+library(isotree)
+
+case20_lines <- readLines("~/Desktop/case20.csv", warn = FALSE)
+
+case20_raw <- tibble(
+  raw_line = case20_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case20_long <- case20_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case20_basket <- case20_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    price_per_second = ifelse(sum(time, na.rm = TRUE) > 0,
+                              sum(price, na.rm = TRUE) / sum(time, na.rm = TRUE),
+                              NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    max_price_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                             max(price, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                             NA_real_),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+case20_basket <- case20_basket %>%
+  mutate(
+    expected_price_given_items = predict(model_price, newdata = case20_basket),
+    price_deviation = total_price - expected_price_given_items
+  )
+
+if_case20_if1 <- case20_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments,
+    price_deviation
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(if_train_if1$sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(if_train_if1$price_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(if_train_if1$max_price_share, na.rm = TRUE)),
+    price_deviation = replace_na(price_deviation, median(if_train_if1$price_deviation, na.rm = TRUE))
+  )
+
+X_case20_if1_raw <- if_case20_if1 %>%
+  select(-transaction_id)
+
+X_case20_if1 <- scale(
+  X_case20_if1_raw,
+  center = attr(X_if1, "scaled:center"),
+  scale = attr(X_if1, "scaled:scale")
+)
+
+if_case20_if1$if_score <- predict(
+  if_model_if1,
+  as.matrix(X_case20_if1),
+  type = "score"
+)
+
+top_150_if_case20_if1 <- if_case20_if1 %>%
+  arrange(desc(if_score)) %>%
+  slice_head(n = 150)
+
+summary(top_150_if_case20_if1$total_items)
+summary(top_150_if_case20_if1$total_price)
+summary(top_150_if_case20_if1$avg_time_per_item)
+summary(top_150_if_case20_if1$price_deviation)
+summary(top_150_if_case20_if1$if_score)
+
+writeLines(as.character(top_150_if_case20_if1$transaction_id))
+
+write.csv(
+  top_150_if_case20_if1,
+  "~/Desktop/top_150_if_case20_if1.csv",
+  row.names = FALSE
+)
+```
+
+
+
+
+
+
+

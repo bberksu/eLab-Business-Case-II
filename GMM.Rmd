@@ -1,0 +1,310 @@
+---
+title: "clastering different features"
+output: pdf_document
+date: "2026-05-03"
+---
+
+# CASE 16
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("mclust")
+```
+
+# TRAIN
+```{r}
+library(tidyverse)
+library(mclust)
+
+# TRAIN DATA
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    max_price_share = ifelse(total_price > 0, max(price, na.rm = TRUE) / total_price, NA_real_),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(price_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(max_price_share, na.rm = TRUE))
+  )
+
+# COMPACT FEATURE SET FOR GMM
+
+gmm_train <- basket_data %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  )
+
+X_gmm_raw <- gmm_train %>%
+  select(-transaction_id)
+
+X_gmm <- scale(X_gmm_raw)
+
+# FIT GMM
+
+set.seed(123)
+
+gmm_model <- Mclust(
+  data = X_gmm,
+  G = 1:8
+)
+
+# density-based anomaly score:
+# lower density = more suspicious
+train_density <- dens(
+  data = X_gmm,
+  modelName = gmm_model$modelName,
+  parameters = gmm_model$parameters
+)
+
+gmm_train$gmm_density <- train_density
+gmm_train$gmm_score <- -log(train_density)
+
+train_pred <- predict(gmm_model, newdata = X_gmm)
+
+gmm_train$cluster_id <- as.integer(train_pred$classification)
+gmm_train$cluster_uncertainty <- 1 - apply(train_pred$z, 1, max)
+
+basket_gmm_train <- basket_data %>%
+  left_join(
+    gmm_train %>%
+      select(transaction_id, gmm_density, gmm_score, cluster_id, cluster_uncertainty),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    gmm_score_01 = percent_rank(gmm_score)
+  ) %>%
+  arrange(desc(gmm_score))
+
+top_150_gmm_train <- basket_gmm_train %>%
+  slice_head(n = 150)
+
+summary(top_150_gmm_train$total_items)
+summary(top_150_gmm_train$total_price)
+summary(top_150_gmm_train$avg_time_per_item)
+summary(top_150_gmm_train$gmm_score)
+summary(top_150_gmm_train$cluster_uncertainty)
+
+write.csv(
+  top_150_gmm_train,
+  "~/Desktop/top_150_gmm_train.csv",
+  row.names = FALSE
+)
+```
+
+# CASE16: PURE GMM DENSITY TEST
+
+```{r}
+case16_lines <- readLines("~/Desktop/case16.csv", warn = FALSE)
+
+case16_raw <- tibble(
+  raw_line = case16_lines
+) %>%
+  mutate(
+    transaction_id = stringr::str_extract(raw_line, "(?<=Transaction\\s)\\d+"),
+    transaction_id = as.integer(transaction_id),
+    basket = stringr::str_remove(raw_line, "^Transaction\\s+\\d+:")
+  )
+
+case16_long <- case16_raw %>%
+  select(transaction_id, basket) %>%
+  separate_rows(basket, sep = ",") %>%
+  mutate(basket = stringr::str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+case16_basket <- case16_long %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    sd_time_per_item = sd(time, na.rm = TRUE),
+    price_per_second = ifelse(total_time > 0, total_price / total_time, NA_real_),
+    max_price = max(price, na.rm = TRUE),
+    max_price_share = ifelse(total_price > 0, max(price, na.rm = TRUE) / total_price, NA_real_),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sd_time_per_item = replace_na(sd_time_per_item, median(gmm_train$sd_time_per_item, na.rm = TRUE)),
+    price_per_second = replace_na(price_per_second, median(gmm_train$price_per_second, na.rm = TRUE)),
+    max_price_share = replace_na(max_price_share, median(gmm_train$max_price_share, na.rm = TRUE))
+  )
+
+gmm_case16 <- case16_basket %>%
+  select(
+    transaction_id,
+    total_items,
+    total_price,
+    avg_price,
+    total_time,
+    avg_time_per_item,
+    sd_time_per_item,
+    price_per_second,
+    max_price,
+    max_price_share,
+    unique_departments
+  )
+
+X_case16_raw <- gmm_case16 %>%
+  select(-transaction_id)
+
+X_case16 <- scale(
+  X_case16_raw,
+  center = attr(X_gmm, "scaled:center"),
+  scale = attr(X_gmm, "scaled:scale")
+)
+
+case16_density <- dens(
+  data = X_case16,
+  modelName = gmm_model$modelName,
+  parameters = gmm_model$parameters
+)
+
+case16_pred <- predict(gmm_model, newdata = X_case16)
+
+gmm_case16$gmm_density <- case16_density
+gmm_case16$gmm_score <- -log(case16_density)
+gmm_case16$cluster_id <- as.integer(case16_pred$classification)
+gmm_case16$cluster_uncertainty <- 1 - apply(case16_pred$z, 1, max)
+
+case16_gmm <- case16_basket %>%
+  left_join(
+    gmm_case16 %>%
+      select(transaction_id, gmm_density, gmm_score, cluster_id, cluster_uncertainty),
+    by = "transaction_id"
+  ) %>%
+  mutate(
+    gmm_score_01 = percent_rank(gmm_score)
+  ) %>%
+  arrange(desc(gmm_score))
+
+top_150_gmm_case16 <- case16_gmm %>%
+  slice_head(n = 150)
+
+summary(top_150_gmm_case16$total_items)
+summary(top_150_gmm_case16$total_price)
+summary(top_150_gmm_case16$avg_time_per_item)
+summary(top_150_gmm_case16$gmm_score)
+summary(top_150_gmm_case16$cluster_uncertainty)
+
+writeLines(as.character(top_150_gmm_case16$transaction_id))
+
+write.csv(
+  top_150_gmm_case16,
+  "~/Desktop/top_150_gmm_case16.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+

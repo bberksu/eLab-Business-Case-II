@@ -1,0 +1,308 @@
+---
+title: "Graph rarity"
+output: pdf_document
+date: "2026-05-04"
+---
+
+# CASE 27
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## TRAIN: graph rarity v2
+
+```{r}
+library(tidyverse)
+
+# PURE GRAPH V2 ON SUPERMARKET
+
+lines <- readLines("~/Desktop/supermarket case/supermarket.csv", warn = FALSE)
+
+supermarket_raw <- tibble(
+  transaction_id = 1:length(lines),
+  basket = lines
+)
+
+dept_map <- c(
+  "1" = "Bakery & Pastry",
+  "2" = "Beer & Wine",
+  "3" = "Books & Magazines",
+  "4" = "Candy & Chips",
+  "5" = "Care & Hygiene",
+  "6" = "Cereals & Spreads",
+  "7" = "Cheese & Tapas",
+  "8" = "Dairy & Eggs",
+  "9" = "Freezer",
+  "10" = "Fruit & Vegetables",
+  "11" = "Household & Pet",
+  "12" = "Meat & Fish",
+  "13" = "Pasta & Rice",
+  "14" = "Salads & Meals",
+  "15" = "Sauces & Spices",
+  "16" = "Soda & Juices",
+  "17" = "Special Diet",
+  "18" = "Vegetarian & Vegan"
+)
+
+long_data <- supermarket_raw %>%
+  separate_rows(basket, sep = ",") %>%
+  group_by(transaction_id) %>%
+  mutate(item_order = row_number()) %>%
+  ungroup() %>%
+  mutate(basket = str_trim(basket)) %>%
+  separate(
+    basket,
+    into = c("department", "time", "price"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "drop"
+  ) %>%
+  mutate(
+    department = as.integer(department),
+    time = as.numeric(time),
+    price = as.numeric(price),
+    department_name = dept_map[as.character(department)]
+  ) %>%
+  filter(
+    !is.na(department),
+    !is.na(time),
+    !is.na(price),
+    !is.na(department_name),
+    time >= 0,
+    price >= 0
+  )
+
+# BASIC BASKET DATA FOR PROFILE ONLY
+
+basket_data <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    total_items = n(),
+    total_price = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    total_time = sum(time, na.rm = TRUE),
+    avg_time_per_item = mean(time, na.rm = TRUE),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  )
+
+# 1. DEGREE RARITY
+
+dept_freq_tbl <- long_data %>%
+  dplyr::count(department, name = "dept_freq") %>%
+  mutate(
+    dept_rarity = 1 / dept_freq
+  )
+
+
+dept_rarity_lookup <- dept_freq_tbl$dept_rarity
+names(dept_rarity_lookup) <- dept_freq_tbl$department
+
+# 2. EDGE COUNTS / EDGE SURPRISE
+
+basket_depts <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    departments = list(sort(unique(department))),
+    .groups = "drop"
+  )
+
+edge_counts <- map_dfr(basket_depts$departments, function(depts) {
+  if (length(depts) < 2) {
+    return(tibble(dept_a = integer(), dept_b = integer()))
+  }
+  pairs <- t(combn(depts, 2))
+  tibble(
+    dept_a = pairs[, 1],
+    dept_b = pairs[, 2]
+  )
+}) %>%
+  dplyr::count(dept_a, dept_b, name = "edge_n") %>%
+  mutate(
+    edge_commonness = edge_n / max(edge_n),
+    edge_surprise = 1 - edge_commonness
+  )
+
+
+edge_lookup <- edge_counts %>%
+  mutate(edge_key = paste(dept_a, dept_b, sep = "_"))
+
+edge_commonness_lookup <- edge_lookup$edge_commonness
+names(edge_commonness_lookup) <- edge_lookup$edge_key
+
+edge_surprise_lookup <- edge_lookup$edge_surprise
+names(edge_surprise_lookup) <- edge_lookup$edge_key
+
+strong_edge_threshold <- quantile(edge_counts$edge_commonness, 0.75, na.rm = TRUE)
+
+# HELPERS
+
+get_edge_keys <- function(depts) {
+  if (length(depts) < 2) return(character(0))
+  pairs <- t(combn(sort(unique(depts)), 2))
+  paste(pairs[, 1], pairs[, 2], sep = "_")
+}
+
+calc_entropy_norm <- function(counts_vec) {
+  probs <- counts_vec / sum(counts_vec)
+  ent <- -sum(probs * log(probs))
+  if (length(probs) <= 1) return(0)
+  ent / log(length(probs))
+}
+
+calc_strong_triangle_share <- function(depts) {
+  depts <- sort(unique(depts))
+  if (length(depts) < 3) return(0)
+
+  triples <- combn(depts, 3, simplify = FALSE)
+
+  strong_flags <- map_lgl(triples, function(tri) {
+    keys <- c(
+      paste(tri[1], tri[2], sep = "_"),
+      paste(tri[1], tri[3], sep = "_"),
+      paste(tri[2], tri[3], sep = "_")
+    )
+    commonness_vals <- edge_commonness_lookup[keys]
+    commonness_vals[is.na(commonness_vals)] <- 0
+    all(commonness_vals >= strong_edge_threshold)
+  })
+
+  mean(strong_flags)
+}
+
+# GRAPH FEATURES PER BASKET
+
+basket_graph_features <- long_data %>%
+  group_by(transaction_id) %>%
+  summarise(
+    departments = list(department),
+    dept_item_counts = list(table(department)),
+    unique_departments = n_distinct(department),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    unique_dept_vec = list(sort(unique(unlist(departments)))),
+
+    avg_dept_rarity = mean(
+      dept_rarity_lookup[as.character(unique_dept_vec)],
+      na.rm = TRUE
+    ),
+
+    max_dept_rarity = max(
+      dept_rarity_lookup[as.character(unique_dept_vec)],
+      na.rm = TRUE
+    ),
+
+    edge_keys = list(get_edge_keys(unique_dept_vec)),
+
+    mean_edge_commonness = ifelse(
+      length(edge_keys) > 0,
+      mean(edge_commonness_lookup[edge_keys], na.rm = TRUE),
+      1
+    ),
+
+    mean_edge_surprise = ifelse(
+      length(edge_keys) > 0,
+      mean(edge_surprise_lookup[edge_keys], na.rm = TRUE),
+      0
+    ),
+
+    max_edge_surprise = ifelse(
+      length(edge_keys) > 0,
+      max(edge_surprise_lookup[edge_keys], na.rm = TRUE),
+      0
+    ),
+
+    strong_edge_share = ifelse(
+      length(edge_keys) > 0,
+      mean(edge_commonness_lookup[edge_keys] >= strong_edge_threshold, na.rm = TRUE),
+      1
+    ),
+
+    graph_entropy = calc_entropy_norm(as.numeric(dept_item_counts)),
+
+    strong_triangle_share = calc_strong_triangle_share(unique_dept_vec)
+  ) %>%
+  ungroup() %>%
+  select(
+    transaction_id,
+    unique_departments,
+    avg_dept_rarity,
+    max_dept_rarity,
+    mean_edge_commonness,
+    mean_edge_surprise,
+    max_edge_surprise,
+    strong_edge_share,
+    graph_entropy,
+    strong_triangle_share
+  ) %>%
+  mutate(
+    clique_surprise = 1 - strong_triangle_share,
+    density_surprise = 1 - strong_edge_share
+  )
+
+# entropy should be judged relative to department count
+entropy_model <- lm(graph_entropy ~ unique_departments, data = basket_graph_features)
+
+basket_graph_features <- basket_graph_features %>%
+  mutate(
+    expected_graph_entropy = predict(entropy_model, newdata = .),
+    entropy_deviation = abs(graph_entropy - expected_graph_entropy)
+  )
+
+# FINAL PURE GRAPH V2 SCORE
+
+basket_graph_v2 <- basket_data %>%
+  left_join(basket_graph_features, by = c("transaction_id", "unique_departments")) %>%
+  mutate(
+    graph_v2_score =
+      0.20 * percent_rank(avg_dept_rarity) +
+      0.10 * percent_rank(max_dept_rarity) +
+      0.25 * percent_rank(mean_edge_surprise) +
+      0.10 * percent_rank(max_edge_surprise) +
+      0.10 * percent_rank(entropy_deviation) +
+      0.10 * percent_rank(density_surprise) +
+      0.15 * percent_rank(clique_surprise)
+  ) %>%
+  arrange(desc(graph_v2_score))
+
+top_150_graph_v2_train <- basket_graph_v2 %>%
+  slice_head(n = 150)
+
+summary(top_150_graph_v2_train$total_items)
+summary(top_150_graph_v2_train$total_price)
+summary(top_150_graph_v2_train$avg_time_per_item)
+summary(top_150_graph_v2_train$avg_dept_rarity)
+summary(top_150_graph_v2_train$mean_edge_surprise)
+summary(top_150_graph_v2_train$entropy_deviation)
+summary(top_150_graph_v2_train$density_surprise)
+summary(top_150_graph_v2_train$clique_surprise)
+
+write.csv(
+  top_150_graph_v2_train,
+  "~/Desktop/top_150_graph_v2_train.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
