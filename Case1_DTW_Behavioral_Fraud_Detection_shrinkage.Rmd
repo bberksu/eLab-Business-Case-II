@@ -1,0 +1,800 @@
+---
+title: "Case 1 - Behavioral / DTW Fraud Detection Prototype"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  reference_data_path: "supermarket.csv"
+  test_data_path: null
+  expected_fraud_share: 0.15
+  output_rows_file: "predicted_fraud_rows.txt"
+  seq_len: 25
+  time_cap: 300
+  price_cap: 20
+  max_reference_rows: null
+  shrinkage_path: "shrinkage.csv"
+---
+
+# Overview
+
+This R Markdown file implements several **behavioral fraud-detection methods** for the supermarket self-checkout case. The focus is on the **sequence and timing behavior** of transactions rather than only on basket totals.
+
+The workflow is designed so that you can:
+
+- use the main `supermarket.csv` file as an unlabeled reference dataset,
+- input a **new testing dataset** in the **same raw format**,
+- score all rows in the testing dataset,
+- return the **top suspected fraud cases**, and
+- write the predicted transaction IDs to a text file with **one transaction ID per line**.
+
+The methods below do **not** require fraud labels in the training data. They learn what *normal* checkout behavior looks like from the reference data and then flag the most behaviorally unusual transactions in the testing data.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+setwd("/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1")
+```
+
+# User Inputs
+
+Set the file paths here before running the notebook.
+
+- `reference_data_path`: the large unlabeled supermarket dataset used to learn normal behavior
+- `test_data_path`: the new testing dataset you want to score
+- `expected_fraud_share`: set to `0.15` because the testing set contains 15% fraud
+- `output_rows_file`: file where the predicted suspicious transaction IDs will be written
+
+```{r inputs}
+reference_data_path <- "/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/supermarket.csv"
+test_data_path      <- "/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/case94.csv"
+shrinkage_path      <- "/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/shrinkage.csv"
+expected_fraud_share <- 0.15
+output_rows_file     <- "predicted_fraud_rows.txt"
+seq_len              <- 100
+time_cap             <- 1000
+price_cap            <- 100
+max_reference_rows   <- NULL
+
+if (is.null(test_data_path)) {
+  message("No separate testing dataset was supplied. For development only, the reference file will also be used as the test file.")
+  test_data_path <- reference_data_path
+}
+```
+
+# Helper Functions
+
+## 1. Reading and parsing raw transaction files
+
+The raw data is expected to have the same structure as `supermarket.csv`: one transaction per row, where each row contains comma-separated item records in the form `department time price`.
+
+```{r helper-read-parse}
+read_transaction_file <- function(file_path, max_rows = NULL) {
+
+  lines <- readLines(file_path, warn = FALSE)
+
+  if (!is.null(max_rows)) {
+
+    lines <- lines[seq_len(min(length(lines), max_rows))]
+
+  }
+
+  embedded_match <- stringr::str_match(
+
+    lines,
+
+    "^\\s*Transaction\\s+([0-9]+)\\s*:\\s*(.*)$"
+
+  )
+
+  has_embedded_id <- !is.na(embedded_match[, 2])
+
+  transaction_ids <- ifelse(
+
+    has_embedded_id,
+
+    as.integer(embedded_match[, 2]),
+
+    seq_along(lines)
+
+  )
+
+  basket_text <- ifelse(
+
+    has_embedded_id,
+
+    embedded_match[, 3],
+
+    lines
+
+  )
+
+  tibble(
+
+    transaction_id = transaction_ids,
+
+    basket = basket_text
+
+  )
+
+}
+
+parse_transaction_file <- function(raw_tbl) {
+  raw_tbl %>%
+    separate_rows(basket, sep = ",") %>%
+    group_by(transaction_id) %>%
+    mutate(item_order = row_number()) %>%
+    ungroup() %>%
+    mutate(basket = str_trim(basket)) %>%
+    separate(
+      basket,
+      into = c("department", "time", "price"),
+      sep = "\\s+",
+      fill = "right",
+      extra = "drop"
+    ) %>%
+    mutate(
+      department = as.integer(department),
+      time = as.numeric(time),
+      price = as.numeric(price)
+    )
+}
+
+clean_long_data <- function(long_data) {
+  long_data %>%
+    filter(
+      !is.na(transaction_id),
+      !is.na(item_order),
+      !is.na(department),
+      !is.na(time),
+      !is.na(price),
+      department >= 1,
+      department <= 18,
+      time >= 0,
+      price >= 0
+    )
+}
+
+
+prepare_shrinkage_lookup <- function(shrinkage_path) {
+  shrinkage <- read.csv(shrinkage_path, stringsAsFactors = FALSE) %>%
+    mutate(
+      item_loss_rate = ifelse(items_expected > 0, items_lost / items_expected, 0),
+      revenue_loss_rate = ifelse(revenue_expected > 0, revenue_lost / revenue_expected, 0),
+      combined_shrinkage_score_raw = 0.4 * item_loss_rate + 0.6 * revenue_loss_rate
+    )
+
+  score_center <- median(shrinkage$combined_shrinkage_score_raw, na.rm = TRUE)
+  score_scale <- IQR(shrinkage$combined_shrinkage_score_raw, na.rm = TRUE)
+  if (is.na(score_scale) || score_scale == 0) score_scale <- 1
+
+  shrinkage %>%
+    transmute(
+      department = as.integer(department),
+      item_loss_rate,
+      revenue_loss_rate,
+      combined_shrinkage_score = (combined_shrinkage_score_raw - score_center) / score_scale
+    )
+}
+
+attach_shrinkage_features <- function(long_data, shrinkage_lookup) {
+  risk_cutoff <- quantile(shrinkage_lookup$combined_shrinkage_score, 0.75, na.rm = TRUE)
+
+  long_data %>%
+    left_join(shrinkage_lookup, by = "department") %>%
+    mutate(
+      item_loss_rate = replace_na(item_loss_rate, 0),
+      revenue_loss_rate = replace_na(revenue_loss_rate, 0),
+      combined_shrinkage_score = replace_na(combined_shrinkage_score, 0),
+      high_risk_department_flag = combined_shrinkage_score >= risk_cutoff
+    )
+}
+
+```
+
+## 2. Behavioral feature engineering
+
+These features summarize each basket from a **behavioral** point of view.
+
+```{r helper-features}
+build_behavior_features <- function(long_data) {
+  seq_base <- long_data %>%
+    arrange(transaction_id, item_order) %>%
+    group_by(transaction_id) %>%
+    mutate(
+      next_department = lead(department),
+      same_department_as_previous = department == lag(department),
+      fast_scan = time <= 10,
+      long_pause = time >= 180,
+      zero_time = time == 0
+    ) %>%
+    summarise(
+      total_items = n(),
+      total_price = sum(price, na.rm = TRUE),
+      total_time = sum(time, na.rm = TRUE),
+      avg_time_per_item = mean(time, na.rm = TRUE),
+      median_time_per_item = median(time, na.rm = TRUE),
+      sd_time_per_item = sd(time, na.rm = TRUE),
+      min_time = min(time, na.rm = TRUE),
+      max_time = max(time, na.rm = TRUE),
+      avg_price_per_item = mean(price, na.rm = TRUE),
+      sd_price = sd(price, na.rm = TRUE),
+      unique_departments = n_distinct(department),
+      fast_scan_share = mean(fast_scan, na.rm = TRUE),
+      long_pause_share = mean(long_pause, na.rm = TRUE),
+      zero_time_share = mean(zero_time, na.rm = TRUE),
+      same_department_share = mean(replace_na(same_department_as_previous, FALSE)),
+      department_switch_rate = mean(department != lag(department), na.rm = TRUE),
+      price_time_correlation = suppressWarnings(cor(price, time, use = "pairwise.complete.obs")),
+      avg_department_risk = mean(combined_shrinkage_score, na.rm = TRUE),
+      max_department_risk = max(combined_shrinkage_score, na.rm = TRUE),
+      total_department_risk = sum(combined_shrinkage_score, na.rm = TRUE),
+      avg_item_loss_rate = mean(item_loss_rate, na.rm = TRUE),
+      avg_revenue_loss_rate = mean(revenue_loss_rate, na.rm = TRUE),
+      high_risk_item_share = mean(high_risk_department_flag, na.rm = TRUE),
+      high_risk_price_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                                     sum(price * high_risk_department_flag, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                     0),
+      risk_weighted_price = sum(price * pmax(combined_shrinkage_score, 0), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      sd_time_per_item = replace_na(sd_time_per_item, 0),
+      sd_price = replace_na(sd_price, 0),
+      price_time_correlation = replace_na(price_time_correlation, 0),
+      avg_department_risk = replace_na(avg_department_risk, 0),
+      max_department_risk = replace_na(max_department_risk, 0),
+      total_department_risk = replace_na(total_department_risk, 0),
+      avg_item_loss_rate = replace_na(avg_item_loss_rate, 0),
+      avg_revenue_loss_rate = replace_na(avg_revenue_loss_rate, 0),
+      high_risk_item_share = replace_na(high_risk_item_share, 0),
+      high_risk_price_share = replace_na(high_risk_price_share, 0),
+      risk_weighted_price = replace_na(risk_weighted_price, 0),
+      burstiness = ifelse(avg_time_per_item > 0, sd_time_per_item / avg_time_per_item, 0),
+      items_per_department = ifelse(unique_departments > 0, total_items / unique_departments, 0),
+      price_per_second = ifelse(total_time > 0, total_price / total_time, 0)
+    )
+
+  seq_base
+}
+```
+
+## 3. Sequence construction for DTW
+
+For the DTW-based methods, each transaction is converted into a multivariate sequence using:
+
+- time between scans,
+- item price, and
+- department code.
+
+To make sequences more comparable, each dimension is capped and scaled.
+
+```{r helper-sequences}
+rescale_sequence <- function(df_txn, seq_len = 25, time_cap = 300, price_cap = 20) {
+  df_txn <- df_txn %>% arrange(item_order)
+
+  x_old <- seq_len(nrow(df_txn))
+  x_new <- seq(1, nrow(df_txn), length.out = seq_len)
+
+  time_scaled <- pmin(df_txn$time, time_cap) / time_cap
+  price_scaled <- pmin(df_txn$price, price_cap) / price_cap
+  dept_scaled <- (df_txn$department - 1) / 17
+  risk_scaled <- pmin(pmax(df_txn$combined_shrinkage_score, -3), 3) / 3
+
+  interp_time <- approx(x_old, time_scaled, xout = x_new, method = "linear", rule = 2)$y
+  interp_price <- approx(x_old, price_scaled, xout = x_new, method = "linear", rule = 2)$y
+  interp_dept <- approx(x_old, dept_scaled, xout = x_new, method = "linear", rule = 2)$y
+  interp_risk <- approx(x_old, risk_scaled, xout = x_new, method = "linear", rule = 2)$y
+
+  cbind(interp_time, interp_price, interp_dept, interp_risk)
+}
+
+build_sequence_list <- function(long_data, seq_len = 25, time_cap = 300, price_cap = 20) {
+  split(long_data, long_data$transaction_id) %>%
+    purrr::map(~ rescale_sequence(.x, seq_len = seq_len, time_cap = time_cap, price_cap = price_cap))
+}
+```
+
+## 4. Custom multivariate DTW distance
+
+To keep the notebook portable, DTW is implemented directly in base R. The local step cost is the Euclidean distance between the resampled feature vectors.
+
+```{r helper-dtw}
+dtw_distance_multivariate <- function(seq_a, seq_b) {
+  n <- nrow(seq_a)
+  m <- nrow(seq_b)
+
+  cost <- matrix(Inf, nrow = n + 1, ncol = m + 1)
+  cost[1, 1] <- 0
+
+  for (i in seq_len(n)) {
+    for (j in seq_len(m)) {
+      local_cost <- sqrt(sum((seq_a[i, ] - seq_b[j, ])^2))
+      cost[i + 1, j + 1] <- local_cost + min(
+        cost[i, j + 1],
+        cost[i + 1, j],
+        cost[i, j]
+      )
+    }
+  }
+
+  cost[n + 1, m + 1] / (n + m)
+}
+```
+
+## 5. Prototype selection for DTW
+
+Instead of comparing every test transaction with every reference transaction, the code builds a small set of **behavior prototypes** from the reference data. These prototypes are selected within basket-size bins so that comparisons stay behaviorally meaningful.
+
+```{r helper-prototypes}
+make_size_bin <- function(total_items) {
+  case_when(
+    total_items <= 10 ~ "small",
+    total_items <= 20 ~ "medium",
+    total_items <= 35 ~ "large",
+    TRUE ~ "very_large"
+  )
+}
+
+select_behavior_prototypes <- function(feature_tbl, n_clusters = 3, max_per_bin = 3000) {
+  selected <- list()
+
+  for (bin in unique(feature_tbl$size_bin)) {
+    df_bin <- feature_tbl %>% filter(size_bin == bin)
+    if (nrow(df_bin) == 0) next
+
+    if (!is.null(max_per_bin) && nrow(df_bin) > max_per_bin) {
+      set.seed(123)
+      df_bin <- df_bin %>% slice_sample(n = max_per_bin)
+    }
+
+    mat <- df_bin %>%
+      select(avg_time_per_item, sd_time_per_item, fast_scan_share, long_pause_share,
+             same_department_share, department_switch_rate, avg_price_per_item,
+             unique_departments, burstiness, avg_department_risk,
+             high_risk_item_share, risk_weighted_price) %>%
+      scale()
+
+    k <- min(n_clusters, nrow(df_bin))
+
+    if (k == 1) {
+      selected[[bin]] <- df_bin %>% slice(1) %>% pull(transaction_id)
+    } else {
+      km <- kmeans(mat, centers = k, nstart = 10)
+      df_bin$cluster <- km$cluster
+
+      medoids <- df_bin %>%
+        group_by(cluster) %>%
+        group_modify(~ {
+          center <- km$centers[unique(.x$cluster), , drop = FALSE]
+          xmat <- .x %>%
+            select(avg_time_per_item, sd_time_per_item, fast_scan_share, long_pause_share,
+                   same_department_share, department_switch_rate, avg_price_per_item,
+                   unique_departments, burstiness, avg_department_risk,
+                   high_risk_item_share, risk_weighted_price) %>%
+            scale(center = attr(mat, "scaled:center"), scale = attr(mat, "scaled:scale"))
+          dists <- rowSums((as.matrix(xmat) - matrix(center, nrow = nrow(xmat), ncol = ncol(xmat), byrow = TRUE))^2)
+          .x[which.min(dists), , drop = FALSE]
+        }) %>%
+        ungroup() %>%
+        pull(transaction_id)
+
+      selected[[bin]] <- medoids
+    }
+  }
+
+  enframe(selected, name = "size_bin", value = "prototype_ids")
+}
+```
+
+## 6. Transition-likelihood model
+
+This second behavioral approach does not use DTW. Instead, it estimates how *unlikely* the observed department-to-department transitions are under normal shopping behavior.
+
+```{r helper-transition-model}
+fit_transition_model <- function(long_data) {
+  transition_counts <- long_data %>%
+    arrange(transaction_id, item_order) %>%
+    group_by(transaction_id) %>%
+    mutate(next_department = lead(department)) %>%
+    ungroup() %>%
+    filter(!is.na(next_department)) %>%
+    count(department, next_department, name = "n")
+
+  all_pairs <- expand_grid(department = 1:18, next_department = 1:18)
+
+  transition_probs <- all_pairs %>%
+    left_join(transition_counts, by = c("department", "next_department")) %>%
+    mutate(n = replace_na(n, 0)) %>%
+    group_by(department) %>%
+    mutate(prob = (n + 1) / (sum(n) + 18)) %>%
+    ungroup()
+
+  dept_time_stats <- long_data %>%
+    group_by(department) %>%
+    summarise(
+      med_time = median(time, na.rm = TRUE),
+      mad_time = mad(time, constant = 1, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(mad_time = ifelse(mad_time <= 0, 1, mad_time))
+
+  list(
+    transition_probs = transition_probs,
+    dept_time_stats = dept_time_stats
+  )
+}
+
+score_transition_anomaly <- function(long_data, model) {
+  transition_scores <- long_data %>%
+    arrange(transaction_id, item_order) %>%
+    group_by(transaction_id) %>%
+    mutate(next_department = lead(department)) %>%
+    ungroup() %>%
+    filter(!is.na(next_department)) %>%
+    left_join(model$transition_probs, by = c("department", "next_department")) %>%
+    mutate(step_nll = -log(prob)) %>%
+    group_by(transaction_id) %>%
+    summarise(
+      transition_nll = mean(step_nll, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  time_scores <- long_data %>%
+    left_join(model$dept_time_stats, by = "department") %>%
+    mutate(time_robust_z = abs(time - med_time) / mad_time) %>%
+    group_by(transaction_id) %>%
+    summarise(
+      time_behavior_score = mean(time_robust_z, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  risk_scores <- long_data %>%
+    group_by(transaction_id) %>%
+    summarise(
+      department_risk_score = mean(combined_shrinkage_score, na.rm = TRUE) +
+        mean(high_risk_department_flag, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  transition_scores %>%
+    full_join(time_scores, by = "transaction_id") %>%
+    full_join(risk_scores, by = "transaction_id") %>%
+    mutate(
+      transition_nll = replace_na(transition_nll, 0),
+      time_behavior_score = replace_na(time_behavior_score, 0),
+      department_risk_score = replace_na(department_risk_score, 0),
+      transition_behavior_score = transition_nll + time_behavior_score + 0.5 * department_risk_score
+    )
+}
+```
+
+## 7. Multivariate behavioral anomaly score
+
+The third approach summarizes each transaction into behavioral features and scores it using **Mahalanobis distance** relative to the reference data.
+
+```{r helper-mahalanobis}
+fit_behavior_baseline <- function(reference_features) {
+  feature_names <- c(
+    "total_items",
+    "total_price",
+    "avg_price_per_item",
+    "max_price",
+    "max_price_share",
+    "unique_departments",
+    "total_time",
+    "avg_time_per_item",
+    "sd_time_per_item",
+    "price_per_second",
+    "department_switch_rate",
+    "same_department_share",
+    "burstiness",
+    "avg_department_risk",
+    "max_department_risk",
+    "risk_weighted_price",
+    "high_risk_item_share",
+    "high_risk_price_share"
+  )
+
+  ref <- reference_features %>%
+    dplyr::select(dplyr::any_of(feature_names)) %>%
+    dplyr::mutate(dplyr::across(everything(), as.numeric))
+
+  # remove columns that are all NA or constant
+  keep_cols <- sapply(ref, function(x) {
+    x_non_na <- x[!is.na(x)]
+    length(x_non_na) > 1 && sd(x_non_na) > 0
+  })
+
+  ref <- ref[, keep_cols, drop = FALSE]
+
+  # median imputation
+  for (j in seq_along(ref)) {
+    ref[[j]][is.na(ref[[j]])] <- median(ref[[j]], na.rm = TRUE)
+  }
+
+  mu <- colMeans(ref)
+
+  # regularized covariance matrix
+  cov_mat <- stats::cov(ref)
+  eps <- 1e-6
+  cov_mat <- cov_mat + diag(eps, ncol(cov_mat))
+
+  list(
+    feature_names = colnames(ref),
+    mean = mu,
+    cov = cov_mat
+  )
+}
+
+score_mahalanobis_behavior <- function(new_features, behavior_model) {
+  X <- new_features %>%
+    dplyr::select(dplyr::any_of(behavior_model$feature_names)) %>%
+    dplyr::mutate(dplyr::across(everything(), as.numeric))
+
+  # add any missing columns back in the same order
+  missing_cols <- setdiff(behavior_model$feature_names, names(X))
+  for (nm in missing_cols) {
+    X[[nm]] <- NA_real_
+  }
+  X <- X[, behavior_model$feature_names, drop = FALSE]
+
+  # median imputation using column medians from new data; fallback to mean from baseline
+  for (j in seq_along(X)) {
+    med_j <- median(X[[j]], na.rm = TRUE)
+    if (is.na(med_j)) med_j <- behavior_model$mean[j]
+    X[[j]][is.na(X[[j]])] <- med_j
+  }
+
+  scores <- mahalanobis(
+    x = as.matrix(X),
+    center = behavior_model$mean,
+    cov = behavior_model$cov
+  )
+
+  tibble::tibble(
+    transaction_id = new_features$transaction_id,
+    mahalanobis_behavior_score = as.numeric(scores)
+
+  )
+}
+
+```
+
+## 8. Rank-based ensemble
+
+Because each method captures a different aspect of suspicious behavior, the final ranking combines them in a simple ensemble.
+
+```{r helper-ensemble}
+rank_normalize <- function(x) {
+  if (all(is.na(x))) return(rep(NA_real_, length(x)))
+  (rank(x, ties.method = "average", na.last = "keep") - 1) / (sum(!is.na(x)) - 1)
+}
+
+make_final_ensemble <- function(score_tbl) {
+  score_tbl %>%
+    mutate(
+      dtw_rank = rank_normalize(dtw_score),
+      transition_rank = rank_normalize(transition_behavior_score),
+      mahalanobis_rank = rank_normalize(mahalanobis_behavior_score),
+      ensemble_score = rowMeans(
+        cbind(dtw_rank, transition_rank, mahalanobis_rank),
+        na.rm = TRUE
+      )
+    ) %>%
+    arrange(desc(ensemble_score))
+}
+```
+
+# Load Reference and Testing Data
+
+The reference file is used to learn normal behavior. The testing file is then scored using the methods above.
+
+```{r load-data}
+reference_raw <- read_transaction_file(reference_data_path, max_rows = max_reference_rows)
+test_raw <- read_transaction_file(test_data_path)
+shrinkage_lookup <- prepare_shrinkage_lookup(shrinkage_path)
+
+reference_long <- reference_raw %>% parse_transaction_file() %>% clean_long_data() %>% attach_shrinkage_features(shrinkage_lookup)
+test_long <- test_raw %>% parse_transaction_file() %>% clean_long_data() %>% attach_shrinkage_features(shrinkage_lookup)
+
+cat("Reference transactions:", n_distinct(reference_long$transaction_id), "\n")
+cat("Test transactions:", n_distinct(test_long$transaction_id), "\n")
+```
+
+# Build Features and Sequences
+
+```{r build-features-sequences}
+reference_features <- build_behavior_features(reference_long) %>%
+  mutate(size_bin = make_size_bin(total_items))
+
+test_features <- build_behavior_features(test_long) %>%
+  mutate(size_bin = make_size_bin(total_items))
+
+reference_sequences <- build_sequence_list(reference_long, seq_len = seq_len, time_cap = time_cap, price_cap = price_cap)
+test_sequences <- build_sequence_list(test_long, seq_len = seq_len, time_cap = time_cap, price_cap = price_cap)
+```
+
+# Method 1: DTW Distance to Normal Behavior Prototypes
+
+This method compares the testing transactions to a small set of **normal behavior prototypes** learned from the reference data. Transactions with larger DTW distances are treated as more suspicious.
+
+```{r method-1-dtw}
+prototype_tbl <- select_behavior_prototypes(reference_features, n_clusters = 3, max_per_bin = 3000)
+prototype_ids <- unlist(prototype_tbl$prototype_ids)
+
+prototype_lookup <- reference_features %>%
+  filter(transaction_id %in% prototype_ids) %>%
+  select(transaction_id, size_bin)
+
+score_dtw_against_prototypes <- function(test_features, test_sequences, prototype_lookup, reference_sequences) {
+  results <- vector("list", nrow(test_features))
+
+  for (i in seq_len(nrow(test_features))) {
+    tx_id <- test_features$transaction_id[i]
+    tx_bin <- test_features$size_bin[i]
+    tx_seq <- test_sequences[[as.character(tx_id)]]
+
+    candidate_prototypes <- prototype_lookup %>% filter(size_bin == tx_bin)
+    if (nrow(candidate_prototypes) == 0) {
+      candidate_prototypes <- prototype_lookup
+    }
+
+    dists <- purrr::map_dbl(candidate_prototypes$transaction_id, function(pid) {
+      ref_seq <- reference_sequences[[as.character(pid)]]
+      dtw_distance_multivariate(tx_seq, ref_seq)
+    })
+
+    results[[i]] <- tibble(
+      transaction_id = tx_id,
+      dtw_score = min(dists, na.rm = TRUE),
+      dtw_mean_score = mean(dists, na.rm = TRUE)
+    )
+  }
+
+  bind_rows(results)
+}
+
+dtw_scores <- score_dtw_against_prototypes(
+  test_features = test_features,
+  test_sequences = test_sequences,
+  prototype_lookup = prototype_lookup,
+  reference_sequences = reference_sequences
+)
+
+head(dtw_scores %>% arrange(desc(dtw_score)), 10)
+```
+
+# Method 2: Transition-Likelihood / Behavioral Sequence Anomaly
+
+This method scores each transaction based on:
+
+- how rare its department transitions are, and
+- how unusual its scan times are relative to normal timings for each department.
+
+```{r method-2-transition}
+transition_model <- fit_transition_model(reference_long)
+transition_scores <- score_transition_anomaly(test_long, transition_model)
+
+head(transition_scores %>% arrange(desc(transition_behavior_score)), 10)
+```
+
+# Method 3: Multivariate Behavioral Anomaly Score
+
+This method uses basket-level behavioral summaries and measures how far each testing transaction is from the normal behavioral baseline.
+
+```{r method-3-mahalanobis}
+behavior_model <- fit_behavior_baseline(reference_features)
+mahalanobis_scores <- score_mahalanobis_behavior(test_features, behavior_model)
+
+head(mahalanobis_scores %>% arrange(desc(mahalanobis_behavior_score)), 10)
+```
+
+# Combine the Methods into a Final Fraud Ranking
+
+The three methods are merged and combined into one rank-based ensemble score.
+
+```{r combine-methods}
+all_scores <- test_features %>%
+  select(transaction_id, total_items, total_price, total_time, avg_time_per_item, size_bin) %>%
+  left_join(dtw_scores, by = "transaction_id") %>%
+  left_join(transition_scores, by = "transaction_id") %>%
+  left_join(mahalanobis_scores, by = "transaction_id")
+
+final_scores <- make_final_ensemble(all_scores)
+
+head(final_scores %>% select(
+  transaction_id, total_items, total_price, total_time,
+  dtw_score, transition_behavior_score,
+  mahalanobis_behavior_score, ensemble_score
+), 20)
+```
+
+# Select the Top Suspected Fraud Cases
+
+The testing datasets are assumed to contain **1000 rows** and **15% fraud**. Therefore, the code returns the **150 most suspicious rows** by default. The code is written more generally, so it will always return `round(0.15 * number_of_test_rows)` transactions.
+
+```{r select-top-cases}
+n_test <- nrow(test_raw)
+expected_fraud_n <- round(expected_fraud_share * n_test)
+
+predicted_fraud_rows <- final_scores %>%
+  slice_max(order_by = ensemble_score, n = expected_fraud_n, with_ties = FALSE) %>%
+  arrange(transaction_id) %>%
+  pull(transaction_id)
+
+cat("Number of predicted fraud cases returned:", length(predicted_fraud_rows), "\n")
+cat("First predicted transaction IDs:\n")
+print(head(predicted_fraud_rows, 20))
+```
+
+# Output: Transaction IDs Only (One Per Line)
+
+This is the output format you asked for. The predicted transaction IDs are written to a text file and also printed line by line.
+
+```{r output-rows}
+writeLines(as.character(predicted_fraud_rows), con = output_rows_file)
+
+cat("Predicted fraud transaction IDs written to:", output_rows_file, "\n\n")
+cat("Predicted fraud transaction IDs (one per line):\n")
+cat(predicted_fraud_rows, sep = "\n")
+```
+
+# Optional: Inspect the Top-Ranked Transactions in More Detail
+
+This section helps you understand *why* a transaction was ranked highly.
+
+```{r inspect-top-cases}
+inspection_tbl <- final_scores %>%
+  filter(transaction_id %in% predicted_fraud_rows) %>%
+  arrange(desc(ensemble_score)) %>%
+  select(
+    transaction_id, size_bin, total_items, total_price, total_time,
+    avg_time_per_item, dtw_score, transition_behavior_score,
+    mahalanobis_behavior_score, ensemble_score
+  )
+
+head(inspection_tbl, 25)
+```
+
+# Suggested Interpretation
+
+The behavioral logic behind the three methods is slightly different:
+
+1. **DTW method**: flags transactions whose scan sequence looks unlike normal checkout behavior.
+2. **Transition-likelihood method**: flags transactions with unusual department orderings and unusual timing patterns.
+3. **Mahalanobis method**: flags transactions with unusual overall behavioral summaries.
+
+The final ensemble is useful because fraud may not always appear in exactly the same way. Some fraudulent baskets may have strange timing, others may have odd sequences, and others may simply look behaviorally inconsistent overall.
+
+# How to Use This with a New Testing Dataset
+
+To test a new dataset, change only these inputs near the start of the notebook:
+
+```r
+reference_data_path <- "path/to/supermarket.csv"
+test_data_path <- "path/to/testing_dataset.csv"
+expected_fraud_share <- 0.15
+output_rows_file <- "predicted_fraud_rows.txt"
+```
+
+Then run the notebook again.
+
+# Important Note
+
+Because the reference dataset is unlabeled, these methods learn **normal behavior**, not confirmed fraud behavior. That means the output should be interpreted as:
+
+- **most suspicious / most behaviorally unusual transactions**,
+- not guaranteed fraud labels.
+
+If you later get access to actual fraud labels for the testing data, you can evaluate performance using precision, recall, and ranking quality.
