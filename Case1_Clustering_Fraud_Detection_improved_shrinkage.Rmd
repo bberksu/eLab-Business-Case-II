@@ -1,0 +1,755 @@
+---
+title: "Case 1 - Improved Clustering-Based Fraud Detection Prototype"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  supermarket_reference_path: "supermarket.csv"
+  cashier_data_path: "cashier_data.csv"
+  test_data_path: null
+  expected_fraud_share: 0.15
+  output_rows_file: "predicted_fraud_ids.txt"
+  k_kmeans_cashier: 18
+  k_kmeans_combined: 16
+  k_kmeans_selfcheckout: 18
+  k_segmented_per_bin: 6
+  max_rows_supermarket_for_combined: 20000
+  max_rows_cashier_for_combined: 10000
+  max_rows_supermarket_for_self: 25000
+  seed: 123
+  shrinkage_path: "shrinkage.csv"
+---
+
+# Overview
+
+This R Markdown file implements an **improved clustering-based fraud detection workflow** for Case 1.
+
+Compared with the earlier version, this file improves the method in four important ways:
+
+1. **Cashier data is treated differently from self-checkout data**  
+   Cashier baskets do not contain time, so cashier-based clustering uses only **shared non-time features**.
+
+2. **Basket size is handled more carefully**  
+   One method uses **size-segmented cashier clustering**, so baskets are compared with normal baskets of similar size.
+
+3. **Self-checkout timing is still used where it makes sense**  
+   A separate supermarket-only clustering method uses **time and behavioral features**, but only on self-checkout data.
+
+4. **The final score is a weighted ensemble**  
+   Instead of relying on one clustering result, the file combines several clustering-based anomaly signals.
+
+The workflow is designed so that you can:
+
+- use `cashier_data.csv` as a **clean no-fraud baseline**,
+- use `supermarket.csv` as a **self-checkout reference**,
+- input a new testing dataset in the same raw format,
+- score all rows in the testing dataset,
+- return the top **15% most suspicious transaction IDs**, and
+- write those transaction IDs to a text file with **one ID per line**.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(cluster)
+setwd("/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1")
+```
+
+# User Inputs
+
+```{r inputs}
+set.seed(123)
+
+supermarket_reference_path <- "/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/supermarket.csv"
+cashier_data_path          <- "/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/cashier_data.csv"
+test_data_path             <- "/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/case97.csv"
+expected_fraud_share       <- 0.15
+output_rows_file           <- "predicted_fraud_rows.txt"
+shrinkage_path             <- "/Users/tristankluth/Desktop/Uni Maastricht/Year 2/Period 5/eLab Business Case II/Case 1/shrinkage.csv"
+
+k_kmeans_cashier           <- 12
+k_pam_cashier              <- 12
+k_kmeans_combined          <- 14
+max_rows_pam_train         <- 5000
+max_rows_supermarket_for_combined <- 15000
+max_rows_cashier_for_combined     <- 15000
+k_segmented_per_bin <- 6
+max_rows_supermarket_for_self <- 20000
+k_kmeans_selfcheckout <- 12
+
+if (is.null(test_data_path)) {
+  message("No separate testing dataset supplied. For development only, supermarket_reference_path will also be used as test data.")
+  test_data_path <- supermarket_reference_path
+}
+```
+
+# Helper Functions
+
+## Read raw transaction files
+
+```{r helper-read}
+read_transaction_file <- function(file_path, source_name = "unknown") {
+  first_line <- readLines(file_path, n = 1, warn = FALSE)
+
+  if (grepl("^\\s*transaction_id\\s*,\\s*basket\\s*$", first_line, ignore.case = TRUE)) {
+    df <- read.csv(file_path, stringsAsFactors = FALSE)
+
+    embedded_match <- stringr::str_match(
+      df$basket,
+      "^\\s*Transaction\\s+([0-9]+)\\s*:\\s*(.*)$"
+    )
+
+    has_embedded_id <- !is.na(embedded_match[, 2])
+
+    transaction_ids <- ifelse(
+      has_embedded_id,
+      as.integer(embedded_match[, 2]),
+      if ("transaction_id" %in% names(df)) as.integer(df$transaction_id) else seq_len(nrow(df))
+    )
+
+    basket_text <- ifelse(
+      has_embedded_id,
+      embedded_match[, 3],
+      df$basket
+    )
+
+    return(
+      tibble(
+        transaction_id = transaction_ids,
+        basket = basket_text,
+        source = source_name
+      )
+    )
+  }
+
+  lines <- readLines(file_path, warn = FALSE)
+
+  embedded_match <- stringr::str_match(
+    lines,
+    "^\\s*Transaction\\s+([0-9]+)\\s*:\\s*(.*)$"
+  )
+
+  has_embedded_id <- !is.na(embedded_match[, 2])
+
+  transaction_ids <- ifelse(
+    has_embedded_id,
+    as.integer(embedded_match[, 2]),
+    seq_along(lines)
+  )
+
+  basket_text <- ifelse(
+    has_embedded_id,
+    embedded_match[, 3],
+    lines
+  )
+
+  tibble(
+    transaction_id = transaction_ids,
+    basket = basket_text,
+    source = source_name
+  )
+}
+```
+
+## Parse basket items
+
+- `supermarket` and `test` items have the format: `department time price`
+- `cashier` items have the format: `department price`
+
+```{r helper-parse}
+parse_transaction_file <- function(transaction_tbl) {
+  transaction_tbl %>%
+    tidyr::separate_rows(basket, sep = ",") %>%
+    dplyr::mutate(
+      basket = stringr::str_trim(basket)
+    ) %>%
+    dplyr::filter(basket != "") %>%
+    dplyr::group_by(transaction_id) %>%
+    dplyr::mutate(
+      item_order = dplyr::row_number()
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      n_parts = stringr::str_count(basket, "\\S+")
+    ) %>%
+    tidyr::extract(
+      basket,
+      into = c("v1", "v2", "v3"),
+      regex = "^\\s*(\\S+)\\s+(\\S+)(?:\\s+(\\S+))?\\s*$",
+      remove = FALSE
+    ) %>%
+    dplyr::mutate(
+      department = as.integer(v1),
+      time = dplyr::case_when(
+        source == "cashier" & n_parts == 2 ~ 0,
+        n_parts == 3 ~ as.numeric(v2),
+        TRUE ~ NA_real_
+      ),
+      price = dplyr::case_when(
+        source == "cashier" & n_parts == 2 ~ as.numeric(v2),
+        n_parts == 3 ~ as.numeric(v3),
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    dplyr::select(transaction_id, department, time, price, source, item_order)
+}
+
+clean_long_data <- function(long_data) {
+  long_data %>%
+    dplyr::filter(
+      !is.na(department),
+      !is.na(price),
+      !is.na(time),
+      department >= 1,
+      department <= 18,
+      price >= 0,
+      time >= 0
+    )
+}
+
+
+prepare_shrinkage_lookup <- function(shrinkage_path) {
+  shrinkage <- read.csv(shrinkage_path, stringsAsFactors = FALSE) %>%
+    mutate(
+      item_loss_rate = ifelse(items_expected > 0, items_lost / items_expected, 0),
+      revenue_loss_rate = ifelse(revenue_expected > 0, revenue_lost / revenue_expected, 0),
+      combined_shrinkage_score_raw = 0.4 * item_loss_rate + 0.6 * revenue_loss_rate
+    )
+
+  score_center <- median(shrinkage$combined_shrinkage_score_raw, na.rm = TRUE)
+  score_scale <- IQR(shrinkage$combined_shrinkage_score_raw, na.rm = TRUE)
+  if (is.na(score_scale) || score_scale == 0) score_scale <- 1
+
+  shrinkage %>%
+    transmute(
+      department = as.integer(department),
+      item_loss_rate,
+      revenue_loss_rate,
+      combined_shrinkage_score = (combined_shrinkage_score_raw - score_center) / score_scale
+    )
+}
+
+attach_shrinkage_features <- function(long_data, shrinkage_lookup) {
+  risk_cutoff <- quantile(shrinkage_lookup$combined_shrinkage_score, 0.75, na.rm = TRUE)
+
+  long_data %>%
+    left_join(shrinkage_lookup, by = "department") %>%
+    mutate(
+      item_loss_rate = replace_na(item_loss_rate, 0),
+      revenue_loss_rate = replace_na(revenue_loss_rate, 0),
+      combined_shrinkage_score = replace_na(combined_shrinkage_score, 0),
+      high_risk_department_flag = combined_shrinkage_score >= risk_cutoff
+    )
+}
+
+```
+
+## Feature engineering
+
+```{r helper-features}
+build_basket_features <- function(long_data) {
+  dept_shares <- long_data %>%
+    count(transaction_id, source, department, name = "dept_count") %>%
+    group_by(transaction_id, source) %>%
+    mutate(dept_share = dept_count / sum(dept_count)) %>%
+    ungroup() %>%
+    mutate(department = paste0("dept_share_", department)) %>%
+    select(transaction_id, source, department, dept_share) %>%
+    pivot_wider(names_from = department, values_from = dept_share, values_fill = 0)
+
+  base_features <- long_data %>%
+    group_by(transaction_id, source) %>%
+    summarise(
+      total_items = n(),
+      total_price = sum(price, na.rm = TRUE),
+      avg_price = mean(price, na.rm = TRUE),
+      median_price = median(price, na.rm = TRUE),
+      sd_price = sd(price, na.rm = TRUE),
+      max_price = max(price, na.rm = TRUE),
+      min_price = min(price, na.rm = TRUE),
+      total_time = sum(time, na.rm = TRUE),
+      avg_time_per_item = mean(time, na.rm = TRUE),
+      median_time_per_item = median(time, na.rm = TRUE),
+      sd_time_per_item = sd(time, na.rm = TRUE),
+      max_time = max(time, na.rm = TRUE),
+      min_time = min(time, na.rm = TRUE),
+      unique_departments = n_distinct(department),
+      fast_scan_share = mean(time <= 10, na.rm = TRUE),
+      long_pause_share = mean(time >= 180, na.rm = TRUE),
+      zero_time_share = mean(time == 0, na.rm = TRUE),
+      repeated_department_share = mean(department == lag(department), na.rm = TRUE),
+      avg_department_risk = mean(combined_shrinkage_score, na.rm = TRUE),
+      max_department_risk = max(combined_shrinkage_score, na.rm = TRUE),
+      total_department_risk = sum(combined_shrinkage_score, na.rm = TRUE),
+      avg_item_loss_rate = mean(item_loss_rate, na.rm = TRUE),
+      avg_revenue_loss_rate = mean(revenue_loss_rate, na.rm = TRUE),
+      high_risk_item_share = mean(high_risk_department_flag, na.rm = TRUE),
+      high_risk_price_share = ifelse(sum(price, na.rm = TRUE) > 0,
+                                     sum(price * high_risk_department_flag, na.rm = TRUE) / sum(price, na.rm = TRUE),
+                                     0),
+      risk_weighted_price = sum(price * pmax(combined_shrinkage_score, 0), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      sd_price = replace_na(sd_price, 0),
+      sd_time_per_item = replace_na(sd_time_per_item, 0),
+      repeated_department_share = replace_na(repeated_department_share, 0),
+      avg_department_risk = replace_na(avg_department_risk, 0),
+      max_department_risk = replace_na(max_department_risk, 0),
+      total_department_risk = replace_na(total_department_risk, 0),
+      avg_item_loss_rate = replace_na(avg_item_loss_rate, 0),
+      avg_revenue_loss_rate = replace_na(avg_revenue_loss_rate, 0),
+      high_risk_item_share = replace_na(high_risk_item_share, 0),
+      high_risk_price_share = replace_na(high_risk_price_share, 0),
+      risk_weighted_price = replace_na(risk_weighted_price, 0),
+      avg_price_per_item = ifelse(total_items > 0, total_price / total_items, NA_real_),
+      price_per_second = ifelse(total_time > 0, total_price / total_time, 0),
+      items_per_department = ifelse(unique_departments > 0, total_items / unique_departments, NA_real_),
+      max_price_share = ifelse(total_price > 0, max_price / total_price, NA_real_)
+    )
+
+  base_features %>%
+    left_join(dept_shares, by = c("transaction_id", "source"))
+}
+
+add_size_bin <- function(df) {
+  df %>%
+    mutate(
+      size_bin = case_when(
+        total_items <= 10 ~ "small",
+        total_items <= 20 ~ "medium",
+        total_items <= 35 ~ "large",
+        TRUE ~ "very_large"
+      )
+    )
+}
+```
+
+## Residual feature from cashier baseline
+
+```{r helper-residual}
+add_residual_feature <- function(cashier_df, other_df_list) {
+  cashier_model_data <- cashier_df %>%
+    filter(!is.na(total_price), !is.na(total_items))
+
+  price_model_cashier <- lm(total_price ~ total_items, data = cashier_model_data)
+
+  add_one <- function(df) {
+    df %>%
+      mutate(
+        expected_total_price_cashier = predict(price_model_cashier, newdata = df),
+        residual_total_price_cashier = total_price - expected_total_price_cashier
+      )
+  }
+
+  list(
+    cashier = add_one(cashier_df),
+    others = purrr::map(other_df_list, add_one)
+  )
+}
+```
+
+## Alignment and scaling helpers
+
+```{r helper-align-scale}
+align_feature_columns <- function(reference_df, new_df, feature_names) {
+  missing_in_reference <- setdiff(feature_names, names(reference_df))
+  missing_in_new <- setdiff(feature_names, names(new_df))
+
+  if (length(missing_in_reference) > 0) {
+    reference_df[missing_in_reference] <- 0
+  }
+
+  if (length(missing_in_new) > 0) {
+    new_df[missing_in_new] <- 0
+  }
+
+  list(
+    reference = reference_df %>% select(all_of(feature_names)),
+    new = new_df %>% select(all_of(feature_names))
+  )
+}
+
+fit_robust_scaler <- function(df) {
+  med <- df %>% summarise(across(everything(), ~ median(.x, na.rm = TRUE)))
+  iqr <- df %>% summarise(across(everything(), ~ IQR(.x, na.rm = TRUE)))
+  iqr[iqr == 0 | is.na(iqr)] <- 1
+  list(median = med, iqr = iqr, feature_names = names(df))
+}
+
+apply_robust_scaler <- function(df, scaler) {
+  x <- as.matrix(df[, scaler$feature_names, drop = FALSE])
+  x <- sweep(x, 2, as.numeric(scaler$median[1, ]), FUN = "-")
+  x <- sweep(x, 2, as.numeric(scaler$iqr[1, ]), FUN = "/")
+  x[is.na(x)] <- 0
+  x
+}
+```
+
+## Distance and scoring helpers
+
+```{r helper-distance}
+row_distance_to_centers <- function(x_mat, centers_mat) {
+  n <- nrow(x_mat)
+  k <- nrow(centers_mat)
+  out <- matrix(NA_real_, nrow = n, ncol = k)
+
+  for (j in seq_len(k)) {
+    diffs <- sweep(x_mat, 2, centers_mat[j, ], FUN = "-")
+    out[, j] <- sqrt(rowSums(diffs^2))
+  }
+
+  out
+}
+
+safe_rank_score <- function(x) {
+  rank(x, ties.method = "average") / length(x)
+}
+```
+
+# Load and Prepare the Datasets
+
+```{r load-data}
+supermarket_raw <- read_transaction_file(supermarket_reference_path, source_name = "supermarket")
+cashier_raw     <- read_transaction_file(cashier_data_path, source_name = "cashier")
+test_raw        <- read_transaction_file(test_data_path, source_name = "test")
+
+cat("Rows in supermarket reference:", nrow(supermarket_raw), "\n")
+cat("Rows in cashier data:", nrow(cashier_raw), "\n")
+cat("Rows in test data:", nrow(test_raw), "\n")
+
+shrinkage_lookup <- prepare_shrinkage_lookup(shrinkage_path)
+```
+
+```{r parse-clean}
+supermarket_long <- supermarket_raw %>% parse_transaction_file() %>% clean_long_data() %>% attach_shrinkage_features(shrinkage_lookup)
+cashier_long     <- cashier_raw %>% parse_transaction_file() %>% clean_long_data() %>% attach_shrinkage_features(shrinkage_lookup)
+test_long        <- test_raw %>% parse_transaction_file() %>% clean_long_data() %>% attach_shrinkage_features(shrinkage_lookup)
+
+cat("Rows in supermarket_long:", nrow(supermarket_long), "\n")
+cat("Rows in cashier_long:", nrow(cashier_long), "\n")
+cat("Rows in test_long:", nrow(test_long), "\n")
+```
+
+```{r build-features}
+supermarket_features <- supermarket_long %>% build_basket_features() %>% add_size_bin()
+cashier_features     <- cashier_long %>% build_basket_features() %>% add_size_bin()
+test_features        <- test_long %>% build_basket_features() %>% add_size_bin()
+
+residual_objects <- add_residual_feature(
+  cashier_df = cashier_features,
+  other_df_list = list(supermarket = supermarket_features, test = test_features)
+)
+
+cashier_features     <- residual_objects$cashier
+supermarket_features <- residual_objects$others$supermarket
+test_features        <- residual_objects$others$test
+
+cat("Supermarket baskets after cleaning:", nrow(supermarket_features), "\n")
+cat("Cashier baskets after cleaning:", nrow(cashier_features), "\n")
+cat("Test baskets after cleaning:", nrow(test_features), "\n")
+```
+
+# Feature Sets
+
+## Shared features
+These are used for cashier-based methods and exclude time variables.
+
+```{r feature-sets}
+dept_feature_names <- paste0("dept_share_", 1:18)
+
+shared_feature_names <- c(
+  "total_items", "total_price", "avg_price", "median_price", "sd_price",
+  "max_price", "min_price", "unique_departments",
+  "avg_price_per_item", "items_per_department", "max_price_share",
+  "expected_total_price_cashier", "residual_total_price_cashier",
+  "avg_department_risk", "max_department_risk", "total_department_risk",
+  "avg_item_loss_rate", "avg_revenue_loss_rate",
+  "high_risk_item_share", "high_risk_price_share", "risk_weighted_price",
+  dept_feature_names
+)
+
+selfcheckout_feature_names <- c(
+  shared_feature_names,
+  "total_time", "avg_time_per_item", "median_time_per_item", "sd_time_per_item",
+  "max_time", "min_time",
+  "fast_scan_share", "long_pause_share", "repeated_department_share",
+  "price_per_second"
+)
+```
+
+# Method 1 - Cashier-only K-means on shared features
+
+```{r method1-kmeans-cashier}
+aligned1 <- align_feature_columns(cashier_features, test_features, shared_feature_names)
+scaler1 <- fit_robust_scaler(aligned1$reference)
+
+cashier_scaled1 <- apply_robust_scaler(aligned1$reference, scaler1)
+test_scaled1    <- apply_robust_scaler(aligned1$new, scaler1)
+
+kmeans_cashier <- kmeans(cashier_scaled1, centers = k_kmeans_cashier, nstart = 30, iter.max = 100)
+dist1 <- row_distance_to_centers(test_scaled1, kmeans_cashier$centers)
+
+method1_results <- test_features %>%
+  transmute(
+    transaction_id,
+    score_kmeans_cashier = apply(dist1, 1, min),
+    cluster_kmeans_cashier = apply(dist1, 1, which.min)
+  )
+```
+
+# Method 2 - Size-segmented cashier clustering
+
+This method compares each test basket only with cashier baskets of similar basket size.
+
+```{r method2-segmented}
+segment_results <- list()
+
+for (bin_name in unique(cashier_features$size_bin)) {
+  cashier_bin <- cashier_features %>% filter(size_bin == bin_name)
+  test_bin    <- test_features %>% filter(size_bin == bin_name)
+
+  if (nrow(cashier_bin) == 0 || nrow(test_bin) == 0) next
+
+  feature_names_bin <- shared_feature_names
+  aligned_bin <- align_feature_columns(cashier_bin, test_bin, feature_names_bin)
+  scaler_bin  <- fit_robust_scaler(aligned_bin$reference)
+
+  cashier_scaled_bin <- apply_robust_scaler(aligned_bin$reference, scaler_bin)
+  test_scaled_bin    <- apply_robust_scaler(aligned_bin$new, scaler_bin)
+
+  centers_bin <- min(k_segmented_per_bin, max(2, floor(nrow(cashier_bin) / 200)))
+  km_bin <- kmeans(cashier_scaled_bin, centers = centers_bin, nstart = 20, iter.max = 100)
+
+  dist_bin <- row_distance_to_centers(test_scaled_bin, km_bin$centers)
+
+  segment_results[[bin_name]] <- tibble(
+    transaction_id = test_bin$transaction_id,
+    score_segmented_cashier = apply(dist_bin, 1, min),
+    cluster_segmented_cashier = apply(dist_bin, 1, which.min)
+  )
+}
+
+method2_results <- bind_rows(segment_results)
+
+# fallback in case some bins are missing
+method2_results <- test_features %>%
+  select(transaction_id) %>%
+  left_join(method2_results, by = "transaction_id") %>%
+  mutate(
+    score_segmented_cashier = replace_na(score_segmented_cashier, max(score_segmented_cashier, na.rm = TRUE)),
+    cluster_segmented_cashier = replace_na(cluster_segmented_cashier, -1L)
+  )
+```
+
+# Method 3 - Combined-source K-means on shared features
+
+```{r method3-combined}
+set.seed(params$seed)
+
+supermarket_train_combined <- if (nrow(supermarket_features) > max_rows_supermarket_for_combined) {
+  supermarket_features %>% slice_sample(n = max_rows_supermarket_for_combined)
+} else {
+  supermarket_features
+}
+
+cashier_train_combined <- if (nrow(cashier_features) > max_rows_cashier_for_combined) {
+  cashier_features %>% slice_sample(n = max_rows_cashier_for_combined)
+} else {
+  cashier_features
+}
+
+combined_train <- bind_rows(cashier_train_combined, supermarket_train_combined)
+
+aligned3 <- align_feature_columns(combined_train, test_features, shared_feature_names)
+scaler3 <- fit_robust_scaler(aligned3$reference)
+
+combined_scaled <- apply_robust_scaler(aligned3$reference, scaler3)
+test_scaled3    <- apply_robust_scaler(aligned3$new, scaler3)
+
+kmeans_combined <- kmeans(combined_scaled, centers = k_kmeans_combined, nstart = 30, iter.max = 100)
+dist3 <- row_distance_to_centers(test_scaled3, kmeans_combined$centers)
+assigned3 <- apply(dist3, 1, which.min)
+
+combined_train_clusters <- combined_train %>%
+  mutate(cluster = kmeans_combined$cluster) %>%
+  count(cluster, source, name = "n") %>%
+  group_by(cluster) %>%
+  mutate(cluster_total = sum(n), share = n / cluster_total) %>%
+  ungroup() %>%
+  select(cluster, source, share) %>%
+  pivot_wider(names_from = source, values_from = share, values_fill = 0)
+
+cluster_profiles <- combined_train_clusters %>%
+  transmute(
+    cluster,
+    cashier_share = cashier,
+    supermarket_share = supermarket
+  )
+
+method3_results <- tibble(
+  transaction_id = test_features$transaction_id,
+  cluster_combined = assigned3,
+  distance_combined = apply(dist3, 1, min)
+) %>%
+  left_join(cluster_profiles, by = c("cluster_combined" = "cluster")) %>%
+  mutate(
+    cashier_share = replace_na(cashier_share, 0),
+    supermarket_share = replace_na(supermarket_share, 0),
+    score_combined = safe_rank_score(distance_combined) + 0.75 * safe_rank_score(1 - cashier_share)
+  )
+```
+
+# Method 4 - Supermarket-only self-checkout clustering with timing features
+
+This method uses only self-checkout baskets, so timing features are meaningful again.
+
+```{r method4-selfcheckout}
+set.seed(params$seed)
+
+supermarket_train_self <- if (nrow(supermarket_features) > max_rows_supermarket_for_self) {
+  supermarket_features %>% slice_sample(n = max_rows_supermarket_for_self)
+} else {
+  supermarket_features
+}
+
+aligned4 <- align_feature_columns(supermarket_train_self, test_features, selfcheckout_feature_names)
+scaler4 <- fit_robust_scaler(aligned4$reference)
+
+supermarket_scaled4 <- apply_robust_scaler(aligned4$reference, scaler4)
+test_scaled4        <- apply_robust_scaler(aligned4$new, scaler4)
+
+kmeans_self <- kmeans(supermarket_scaled4, centers = k_kmeans_selfcheckout, nstart = 30, iter.max = 100)
+dist4 <- row_distance_to_centers(test_scaled4, kmeans_self$centers)
+assigned4 <- apply(dist4, 1, which.min)
+
+cluster_sizes_self <- tibble(
+  cluster_selfcheckout = seq_len(k_kmeans_selfcheckout),
+  cluster_size_selfcheckout = as.integer(table(factor(kmeans_self$cluster, levels = seq_len(k_kmeans_selfcheckout))))
+)
+
+method4_results <- tibble(
+  transaction_id = test_features$transaction_id,
+  cluster_selfcheckout = assigned4,
+  distance_selfcheckout = apply(dist4, 1, min)
+) %>%
+  left_join(cluster_sizes_self, by = "cluster_selfcheckout") %>%
+  mutate(
+    cluster_size_selfcheckout = replace_na(cluster_size_selfcheckout, 1L),
+    score_selfcheckout = safe_rank_score(distance_selfcheckout) + 0.5 * safe_rank_score(1 / cluster_size_selfcheckout)
+  )
+```
+
+# Final Ensemble Score
+
+The final score puts more weight on:
+- cashier-based shared-feature distance,
+- size-segmented cashier distance,
+- and self-checkout timing-aware clustering.
+
+```{r ensemble}
+all_scores <- method1_results %>%
+  left_join(method2_results, by = "transaction_id") %>%
+  left_join(method3_results %>% select(transaction_id, score_combined, cluster_combined, cashier_share), by = "transaction_id") %>%
+  left_join(method4_results %>% select(transaction_id, score_selfcheckout, cluster_selfcheckout), by = "transaction_id") %>%
+  mutate(
+    rank_kmeans_cashier = safe_rank_score(score_kmeans_cashier),
+    rank_segmented_cashier = safe_rank_score(score_segmented_cashier),
+    rank_combined = safe_rank_score(score_combined),
+    rank_selfcheckout = safe_rank_score(score_selfcheckout),
+    final_ensemble_score =
+      0.30 * rank_kmeans_cashier +
+      0.30 * rank_segmented_cashier +
+      0.15 * rank_combined +
+      0.25 * rank_selfcheckout
+  ) %>%
+  arrange(desc(final_ensemble_score),
+          desc(score_segmented_cashier),
+          desc(score_kmeans_cashier),
+          desc(score_selfcheckout))
+
+head(all_scores %>% select(transaction_id, final_ensemble_score, score_kmeans_cashier, score_segmented_cashier, score_combined, score_selfcheckout), 10)
+```
+
+# Select the Predicted Fraud Transaction IDs
+
+```{r final-selection}
+n_test <- nrow(test_features)
+n_flag <- ceiling(expected_fraud_share * n_test)
+
+predicted_fraud_ids <- all_scores %>%
+  slice_head(n = n_flag) %>%
+  pull(transaction_id)
+
+cat("Number of rows flagged:", length(predicted_fraud_ids), "\n")
+head(predicted_fraud_ids, 20)
+```
+
+# Write the Transaction IDs to a Text File
+
+```{r write-output}
+writeLines(as.character(predicted_fraud_ids), con = output_rows_file)
+cat("Predicted transaction IDs written to:", output_rows_file, "\n")
+```
+
+# Final Output Block
+
+```{r print-output, results='asis'}
+cat(paste(predicted_fraud_ids, collapse = "\n"))
+```
+
+# Diagnostics
+
+```{r diagnostics}
+all_scores %>%
+  summarise(
+    avg_score_kmeans_cashier = mean(score_kmeans_cashier, na.rm = TRUE),
+    avg_score_segmented_cashier = mean(score_segmented_cashier, na.rm = TRUE),
+    avg_score_combined = mean(score_combined, na.rm = TRUE),
+    avg_score_selfcheckout = mean(score_selfcheckout, na.rm = TRUE),
+    avg_final_score = mean(final_ensemble_score, na.rm = TRUE)
+  )
+
+all_scores %>%
+  slice_head(n = min(20, n_flag)) %>%
+  left_join(test_features, by = "transaction_id") %>%
+  select(
+    transaction_id,
+    final_ensemble_score,
+    total_items,
+    total_price,
+    total_time,
+    avg_time_per_item,
+    max_price,
+    max_price_share,
+    unique_departments,
+    residual_total_price_cashier,
+    cluster_kmeans_cashier,
+    cluster_segmented_cashier,
+    cluster_combined,
+    cluster_selfcheckout,
+    cashier_share
+  ) %>%
+  arrange(desc(final_ensemble_score))
+```
+
+# Notes for Interpretation
+
+- Cashier data is now used only with **shared non-time basket features**.
+- Timing variables are used only in the **self-checkout-only clustering method**, where they are meaningful.
+- The final method is still unsupervised, so it does **not prove fraud**. It identifies baskets that are least consistent with normal basket structure and self-checkout behavior.
+- The first things to tune further are:
+  - the cluster counts,
+  - the ensemble weights,
+  - the basket-size segmentation,
+  - and the exact feature sets used by the cashier-based and self-checkout-based methods.
